@@ -75,7 +75,7 @@ class ImageCaptionDatasetBase(torch.utils.data.Dataset):
         elif self.dataset in ['cc3m', 'cc12m']:
             row = self.tsv.seek(i)
             img = img_from_base64(row[-1])
-            caption = row[-2]
+            caption = row[-2]     
         # elif self.dataset == 'cc3m':
         #     ann = self.samples[i]
         #     filename, captions = ann['image_id'], ann['captions']
@@ -126,6 +126,28 @@ class ImageCaptionDatasetCLIP(ImageCaptionDatasetBase):
 
         return image, caption
 
+class TripletDataset(torch.utils.data.Dataset):
+    def __init__(self, name, tsv_file, trio_file, preprocess, tokenizer) -> None:
+        super().__init__()
+        self.name = name
+        self.triplets = json.load(open(trio_file, 'r'))
+        print(f'Load {name} from {trio_file} ...')
+        self.tsv = TSVFile(tsv_file)
+        self.preprocess = preprocess
+        self.tokenizer = tokenizer
+        
+    def __len__(self):
+        return len(self.triplets)
+    
+    def __getitem__(self, index):
+        img_name, id, en, zh = self.triplets[index]
+        row = self.tsv.seek(id)
+        image = img_from_base64(row[-1])
+        if self.preprocess is not None:
+            image = self.preprocess(image)
+        en = self.tokenizer['en'](en)
+        zh = self.tokenizer['zh'](zh)
+        return self.name, img_name, image, en, zh
 
 class ImageCaptionDatasetSLIP(ImageCaptionDatasetBase):
     def __init__(self, dataset, root, metadata, transform, augment, tokenizer=None):
@@ -242,3 +264,6 @@ def get_dataset(train_transform, tokenizer, args):
         return ImageCaptionDatasetCLIP(args.dataset, args.root, args.metadata, train_transform, tokenizer)
     elif args.model.startswith('SLIP'):
         return ImageCaptionDatasetSLIP(args.dataset, args.root, args.metadata, train_transform, augment, tokenizer)
+    elif args.model.startswith('TRIPLET'):
+        return TripletDataset(name=args.dataset, tsv_file=args.root, trio_file=args.metadata, preprocess=train_transform, 
+                              tokenizer=tokenizer) # a dict

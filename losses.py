@@ -6,10 +6,69 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch.nn.modules.loss import _Loss
 import utils
+from utils import get_rank, get_world_size
 
+class ClipInfoCELoss(_Loss):
+    def __init__(self):
+        super(ClipInfoCELoss, self).__init__()
+    def forward(self, logits_per_image, logits_per_text):
+        bs, l_bs = logits_per_image.shape
+        if l_bs == bs:
+            labels = torch.arange(len(logits_per_image)).cuda()
+        else:
+            labels = get_rank() * bs + torch.arange(0, bs, dtype=torch.long).cuda()
 
+        loss_i = F.cross_entropy(logits_per_image, labels)
+        loss_t = F.cross_entropy(logits_per_text, labels)
+        #loss = (loss_i+loss_t)/2
+        
+        pred_i = torch.argmax(logits_per_image, dim=-1) #bs,
+        pred_t = torch.argmax(logits_per_text, dim=-1) #bs,
+        acc_i = (torch.sum(pred_i==labels)/bs).item()
+        acc_t = (torch.sum(pred_t==labels)/bs).item()
+        return loss_i, loss_t, acc_i*100, acc_t*100
+
+class ClipInfoCELoss2(_Loss):
+    def __init__(self, mode='log_plus'):
+        super(ClipInfoCELoss2, self).__init__()
+        self.mode=mode
+    def forward(self, logits):
+        bs, l_bs = logits.shape
+        assert l_bs%2==0, logits.shape
+        if l_bs == bs*2:
+            labels1 = torch.arange(bs).cuda()
+            labels2 = bs+labels1
+        else:
+            labels1 = get_rank()*bs + torch.arange(bs).cuda()
+            labels2 = labels1+ (bs*get_world_size())
+        if self.mode=='log_plus':
+            loss1 = F.cross_entropy(logits, labels1)
+            loss2 = F.cross_entropy(logits, labels2)
+            loss = loss1+loss2
+            preds = torch.argmax(logits, dim=-1)#bs,
+            acc1 = (torch.sum(preds==labels1))/bs
+            acc2 = (torch.sum(preds==labels2))/bs
+            acc1, acc2 = acc1.item(), acc2.item()
+           # print('labels1:', labels1, '    labels2:', labels2, end=' ')
+            #print('preds:', preds, 'acc1:{:.2f} acc2:{:.2f}'.format(acc1, acc2), end='\n')
+            return loss, acc1*100, acc2*100
+        elif self.mode=='plus_log':
+            target_id = torch.arange(l_bs, device=labels1.device).unsqueeze(0).tile(bs,1) #bs,l_bs
+            labels1_, labels2_ = labels1[:,None], labels2[:,None] #bs, 1
+            target = ((target_id==labels1_)+(target_id==labels2_)).float() #bs, l_bs
+            nominator = torch.logsumexp(logits*target)
+            
+            loss = F.cross_entropy(logits, target)
+            preds = torch.argmax(logits, dim=-1)#bs,
+            acc1 = (torch.sum(preds==labels1))/bs
+            acc2 = (torch.sum(preds==labels2))/bs
+            print(target)
+            return loss, acc1, acc2
+        else:
+            raise ValueError
+        
 class CLIPLoss(nn.Module):
     def __init__(self):
         super().__init__()

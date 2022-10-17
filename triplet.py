@@ -1,24 +1,20 @@
-from utils.misc import freeze_params, get_rank, unfreeze_params, world_size
+from utils import freeze_params, get_rank, unfreeze_params, get_world_size
 from modelling.loss import ClipInfoCELoss, ClipInfoCELoss2
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
 from collections import defaultdict
-from modelling.distiller import EMA, set_requires_grad
-from modelling.distiller import TextEncoder_En, TextEncoder_Zh
-from utils.misc import get_logger, world_size
 import wukong, clip
 from copy import deepcopy
 import numpy as np
 import torch.distributed as dist
-from wukong.simple_tokenizer_wukong import WordpieceTokenizer
 
 class AllGather(torch.autograd.Function):
     
     @staticmethod
     def forward(ctx, tensor):
         ctx.rank = get_rank()
-        ctx.world_size = world_size()
+        ctx.world_size = get_world_size()
 
 #         y = tensor.new(ctx.world_size, *tensor.size())
         

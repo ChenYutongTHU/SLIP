@@ -112,6 +112,7 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], bucket_cap_mb=200)
 
     # define loss function (criterion) and optimizer
+
     criterion = models.get_loss(args.model, args.ssl_temp, args.ssl_scale).cuda(args.gpu)
 
     p_wd, p_non_wd = [], []
@@ -164,7 +165,10 @@ def main(args):
 
     # Data loading code
     print("=> creating dataset")
-    tokenizer = SimpleTokenizer()
+    if args.model.startswith('TRIPLET'):
+        tokenizer = {'en':utils.get_model(model).tokenize_en, 'zh':utils.get_model(model).tokenize_zh}
+    else:
+        tokenizer = SimpleTokenizer()
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
     train_transform = transforms.Compose([
@@ -295,14 +299,19 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         it = iters_per_epoch * epoch + optim_iter  # global training iteration
         for k, param_group in enumerate(optimizer.param_groups):
             param_group['lr'] = lr_schedule[it]
-
-        inputs = [tensor.cuda(args.gpu, non_blocking=True) for tensor in inputs]
+        
+        if args.model!='TRIPLET':
+            inputs = [tensor.cuda(args.gpu, non_blocking=True) for tensor in inputs]
 
         # compute output
         with amp.autocast(enabled=not args.disable_amp):
-            outputs = model(*inputs)
-            loss_dict = criterion(outputs)
-            loss = loss_dict['loss']
+            if args.model=='TRIPLET':
+                loss_dict, features_dict, acc_dict = model(img=inputs['img'], en=inputs['en'], zh=inputs['zh'])
+                loss = loss_dict['total']
+            else:
+                outputs = model(*inputs)
+                loss_dict = criterion(outputs)
+                loss = loss_dict['loss']
             loss /= args.update_freq
 
         if not math.isfinite(loss.item()):
@@ -373,7 +382,10 @@ def validate_zeroshot(val_loader, model, tokenizer, args):
         for l in labels:
             texts = [t.format(l) for t in templates]
             texts = tokenizer(texts).cuda(args.gpu, non_blocking=True)
-            class_embeddings = utils.get_model(model).encode_text(texts)
+            if args.model.startswith('TRIPLET'):
+                class_embeddings = utils.get_model(model).model_en.encode_text(texts)
+            else:
+                class_embeddings = utils.get_model(model).encode_text(texts)
             class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
             class_embeddings = class_embeddings.mean(dim=0)
             class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)

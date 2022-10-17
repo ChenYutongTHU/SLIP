@@ -10,9 +10,22 @@ import shutil
 import torch
 import torch.distributed as dist
 import torch.autograd as autograd
-
+import torch.nn as nn
 from PIL import ImageFilter
 
+def freeze_params(module: nn.Module):
+    """
+    Freeze the parameters of this module,
+    i.e. do not update them during training
+    :param module: freeze parameters of this module
+    """
+    for _, p in module.named_parameters():
+        p.requires_grad = False
+def unfreeze_params(module: nn.Module):
+    for _, p in module.named_parameters():
+        p.requires_grad = True   
+        
+        
 
 def get_model(model):
     if isinstance(model, torch.nn.DataParallel) \

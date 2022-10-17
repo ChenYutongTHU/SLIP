@@ -11,6 +11,8 @@ import numpy as np
 import timm
 import torch
 from torch import nn
+from utils import load_config
+from triplet import Triplet
 
 import losses
 
@@ -243,6 +245,8 @@ def get_loss(model, ssl_temp, ssl_scale):
         return losses.CLIPLoss()
     if model.startswith('SIMCLR'):
         return losses.SIMCLRLoss(temperature=ssl_temp)
+    if model.startswith('TRIPLET'):
+        return None
 
 
 def get_metric_names(model):
@@ -330,6 +334,6 @@ def SLIP_VITL16(**kwargs):
 
     return model
 
-def TRIPLET(cfg_path, **kwargs):
-    cfg = load_config(cfg_path)
+def TRIPLET(model_cfg_path, **kwargs):
+    cfg = load_config(model_cfg_path)
     model = Triplet(cfg, device='cpu')
