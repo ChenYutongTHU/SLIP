@@ -15,7 +15,7 @@ from PIL import Image, ImageFile
 import torch
 from torchvision import transforms
 from torchvision import datasets as t_datasets
-
+from read_tsv import TSVFile, img_from_base64
 import utils
 
 
@@ -55,7 +55,8 @@ class ImageCaptionDatasetBase(torch.utils.data.Dataset):
                 samples[ann['image_id']].append(ann['caption'])
             self.samples = [(k, v) for k, v in samples.items()]
         elif self.dataset == 'cc12m' or self.dataset == 'cc3m':
-            self.samples = np.load(metadata, allow_pickle=True)
+            #self.samples = np.load(metadata, allow_pickle=True)
+            self.tsv = TSVFile(root)
         elif self.dataset == 'redcaps':
             with open(metadata) as f:
                 annotations = json.load(f)
@@ -71,18 +72,23 @@ class ImageCaptionDatasetBase(torch.utils.data.Dataset):
             path = os.path.join(self.root, 'train2017', '{:012d}.jpg'.format(index))
             img = pil_loader(path)
             caption = np.random.choice(captions)
-        elif self.dataset == 'cc3m':
-            ann = self.samples[i]
-            filename, captions = ann['image_id'], ann['captions']
-            path = os.path.join(self.root, str(filename))
-            img = pil_loader(path)
-            caption = np.random.choice(captions)
-        elif self.dataset == 'cc12m':
-            ann = self.samples[i]
-            filename, captions = ann['image_name'], ann['captions']
-            path = os.path.join(self.root, filename)
-            img = pil_loader(path)
-            caption = np.random.choice(captions)
+        elif self.dataset in ['cc3m', 'cc12m']:
+            row = self.tsv.seek(i)
+            img = img_from_base64(row[-1])
+            caption = row[-2]
+        # elif self.dataset == 'cc3m':
+        #     ann = self.samples[i]
+        #     filename, captions = ann['image_id'], ann['captions']
+        #     path = os.path.join(self.root, str(filename))
+        #     img = pil_loader(path)
+        #     caption = np.random.choice(captions)
+        # elif self.dataset == 'cc12m':
+        #     ann = self.samples[i]
+        #     filename, captions = ann['image_name'], ann['captions']
+        #     path = os.path.join(self.root, filename)
+        #     img = pil_loader(path)
+        #     caption = np.random.choice(captions)
+
         elif self.dataset == 'redcaps':
             image_id, subreddit, caption = self.samples[i]
             path = os.path.join(self.root, subreddit, f"{image_id}.jpg")
@@ -94,7 +100,10 @@ class ImageCaptionDatasetBase(torch.utils.data.Dataset):
         raise NotImplementedError
 
     def __len__(self):
-        return len(self.samples)
+        if self.dataset in ['cc3m', 'cc12m']:
+            return self.tsv.num_rows()
+        else:
+            return len(self.samples)
 
 
 class ImageCaptionDatasetCLIP(ImageCaptionDatasetBase):

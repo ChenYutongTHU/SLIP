@@ -23,7 +23,7 @@ import torch.utils.data
 import torch.utils.data.distributed
 from torchvision.datasets import ImageFolder
 import torchvision.transforms as transforms
-
+from imagenetv2_pytorch import ImageNetValDataset
 import datasets
 import models
 from tokenizer import SimpleTokenizer
@@ -177,10 +177,14 @@ def main(args):
         ])
 
     train_dataset = datasets.get_dataset(train_transform, tokenizer, args)
+    
+    '''
     cwd = os.path.dirname(os.path.realpath(__file__))
     with open(os.path.join(cwd, 'dataset_catalog.json')) as f:
         root = json.load(f)['imagenet']['path']
     val_dataset = ImageFolder(os.path.join(root, 'val'), val_transform)
+    '''
+    val_dataset = ImageNetValDataset(transform=val_transform)
 
     # dist eval resamples data to pad uneven batch sizes
     # make sure num_samples = 0 mod num_gpus for exact acc
