@@ -147,7 +147,7 @@ class TripletDataset(torch.utils.data.Dataset):
             image = self.preprocess(image)
         en = self.tokenizer['en'](en)
         zh = self.tokenizer['zh'](zh)
-        return self.name, img_name, image, en, zh
+        return {'img':image, 'en':en, 'zh':zh}
 
 class ImageCaptionDatasetSLIP(ImageCaptionDatasetBase):
     def __init__(self, dataset, root, metadata, transform, augment, tokenizer=None):

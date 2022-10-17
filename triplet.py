@@ -1,5 +1,5 @@
 from utils import freeze_params, get_rank, unfreeze_params, get_world_size
-from modelling.loss import ClipInfoCELoss, ClipInfoCELoss2
+from losses import ClipInfoCELoss, ClipInfoCELoss2
 import torch.nn as nn
 import torch.nn.functional as F
 import torch

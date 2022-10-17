@@ -112,9 +112,9 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], bucket_cap_mb=200)
 
     # define loss function (criterion) and optimizer
-
-    criterion = models.get_loss(args.model, args.ssl_temp, args.ssl_scale).cuda(args.gpu)
-
+    criterion = models.get_loss(args.model, args.ssl_temp, args.ssl_scale)
+    if criterion is not None:
+        criterion = criterion.cuda(args.gpu)
     p_wd, p_non_wd = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -191,7 +191,7 @@ def main(args):
         root = json.load(f)['imagenet']['path']
     val_dataset = ImageFolder(os.path.join(root, 'val'), val_transform)
     '''
-    val_dataset = ImageNetValDataset(transform=val_transform)
+    val_dataset = ImageNetValDataset(transform=val_transform, location='../CLIP_distillation')
 
     # dist eval resamples data to pad uneven batch sizes
     # make sure num_samples = 0 mod num_gpus for exact acc
@@ -214,8 +214,10 @@ def main(args):
         if args.model.startswith('SIMCLR'):
             print('zero-shot evaluation not supported with ssl-only model.')
             return
-
-        zero_stats = validate_zeroshot(val_loader, model, tokenizer, args)
+        elif args.model.startswith('TRIPLET'):
+            zero_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+        else:
+            zero_stats = validate_zeroshot(val_loader, model, tokenizer, args)
         if utils.is_main_process():
             with open(os.path.join(args.output_dir, 'eval_log.txt'), 'a') as f:
                 f.write(json.dumps(zero_stats) + '\n')
@@ -227,7 +229,7 @@ def main(args):
     if utils.is_main_process() and args.wandb:
         wandb.login(key='5421ff43bf1e3a6e19103432d161c885d4bbeda8')
         wandb_id = os.path.split(args.output_dir)[-1]
-        wandb.init(project='slip', id=wandb_id, config=args, resume='allow')
+        wandb.init(project='slip', id=wandb_id, config=args)
 
     print(args)
 
@@ -245,6 +247,9 @@ def main(args):
         if args.model.startswith('SIMCLR'):
             val_stats = {'acc1': -1}
             acc1 = -1
+        elif args.model.startswith('TRIPLET'):
+            val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+            acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],val_stats['zh+en_prob_acc1'])
         else:
             val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
             acc1 = val_stats['acc1']
@@ -280,10 +285,11 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
     metric_names = models.get_metric_names(args.model)
     iters_per_epoch = len(train_loader) // args.update_freq
     metrics = OrderedDict([(name, AverageMeter(name, ':.2e')) for name in metric_names])
-    progress = ProgressMeter(
-        iters_per_epoch,
-        [batch_time, data_time, mem, *metrics.values()],
-        prefix="Epoch: [{}]".format(epoch))
+    if len(metrics):
+        progress = ProgressMeter(
+            iters_per_epoch,
+            [batch_time, data_time, mem, *metrics.values()],
+            prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
     model.train()
@@ -306,8 +312,16 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         # compute output
         with amp.autocast(enabled=not args.disable_amp):
             if args.model=='TRIPLET':
-                loss_dict, features_dict, acc_dict = model(img=inputs['img'], en=inputs['en'], zh=inputs['zh'])
+                loss_dict, features_dict, acc_dict = model(
+                    img=inputs['img'],
+                    en=inputs['en'].squeeze(1), zh=inputs['zh'].squeeze(1))
                 loss = loss_dict['total']
+                if len(metrics)==0:
+                    metrics = OrderedDict([(name, AverageMeter(name, ':.2e')) for name in list(loss_dict.keys())+list(acc_dict.keys())])
+                    progress = ProgressMeter(
+                        iters_per_epoch,
+                        [batch_time, data_time, mem, *metrics.values()],
+                        prefix="Epoch: [{}]".format(epoch))
             else:
                 outputs = model(*inputs)
                 loss_dict = criterion(outputs)
@@ -346,7 +360,8 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
 
         if optim_iter % args.print_freq == 0:
             if utils.is_main_process() and args.wandb:
-                wandb.log({**{k: v.item() for k, v in loss_dict.items()},
+                wandb.log({**{f'loss/{k}': v.item() for k, v in loss_dict.items()},
+                        #**{f'acc/{k}': v.item() for k, v in loss_dict.items()},
                         'scaler': scaler.get_scale(),
                         'logit': logit_scale})
             progress.display(optim_iter)
@@ -356,6 +371,82 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
             'lr': optimizer.param_groups[0]['lr'],
             'logit_scale': logit_scale}
 
+
+def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
+    model.eval()
+    batch_time = AverageMeter('Time', ':6.3f')
+    top1, top5 = {},{}
+    keys = ['zh','en', 'zh+en_prob']#, 'zh+en_feature']
+    for k in keys:
+        top1[k] = AverageMeter(f'Acc@1_{k}', ':6.2f')
+        top5[k] = AverageMeter(f'Acc@5_{k}', ':6.2f')
+    progress = ProgressMeter(
+        len(val_loader),
+        [batch_time]+[top1[k] for k in keys] + [top5[k] for k in keys],
+        prefix='Test: ')
+
+    print('=> encoding captions')
+    cwd = os.path.dirname(os.path.realpath(__file__))
+    with torch.no_grad():
+        lang2text_features = {}
+        for lang in ['zh','en']:
+            lang2text_features[lang] = []
+            templates = open(os.path.join(cwd,f'{lang}_templates.txt'),'r').readlines()
+            templates = [t.strip() for t in templates]
+            labels = json.load(open(os.path.join(cwd,f'imagenet_class_name_{lang}.json'),'r'))
+            for id in sorted(labels):
+                l = labels[id]
+                texts = [t.format(l) for t in templates]
+                texts = tokenizer[lang](texts).cuda(args.gpu, non_blocking=True)
+                if lang=='zh':
+                    class_embeddings = utils.get_model(model).model_zh.encode_text(texts)
+                else:
+                    class_embeddings = utils.get_model(model).model_en.encode_text(texts)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                class_embeddings = class_embeddings.mean(dim=0)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                lang2text_features[lang].append(class_embeddings)
+            lang2text_features[lang] = torch.stack(lang2text_features[lang], dim=0)
+            end = time.time()
+        
+        for i, (images, target) in enumerate(val_loader):
+            images = images.cuda(args.gpu, non_blocking=True)
+            target = target.cuda(args.gpu, non_blocking=True)
+
+            # encode images
+            image_features = utils.get_model(model).encode_image(images)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+            # cosine similarity as logits
+            logits_per_image = {}
+            for lang, text_features in lang2text_features.items():
+                logits_per_image[lang] = image_features @ text_features.t()
+                acc1, acc5 = accuracy(logits_per_image[lang], target, topk=(1, 5))
+                acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+                top1[lang].update(acc1.item(), images.size(0))
+                top5[lang].update(acc5.item(), images.size(0))
+
+            #bilingual ensemble
+            logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en']
+            acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
+            acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+            top1['zh+en_prob'].update(acc1.item(), images.size(0))
+            top5['zh+en_prob'].update(acc5.item(), images.size(0))            
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+
+    progress.synchronize()
+    return_dict = {}
+    for k in keys:
+        top1_, top5_ = top1[k], top5[k]
+        print(k+': 0-shot * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+            .format(top1=top1_, top5=top5_))
+        return_dict[f'{k}_acc1'], return_dict[f'{k}_acc5'] = top1_.avg, top5_.avg
+    return return_dict
 
 def validate_zeroshot(val_loader, model, tokenizer, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -381,7 +472,7 @@ def validate_zeroshot(val_loader, model, tokenizer, args):
         text_features = []
         for l in labels:
             texts = [t.format(l) for t in templates]
-            texts = tokenizer(texts).cuda(args.gpu, non_blocking=True)
+            texts = tokenizer['en'](texts).cuda(args.gpu, non_blocking=True)
             if args.model.startswith('TRIPLET'):
                 class_embeddings = utils.get_model(model).model_en.encode_text(texts)
             else:

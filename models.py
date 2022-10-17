@@ -254,6 +254,8 @@ def get_metric_names(model):
         return ['loss', 'clip_loss', 'ssl_loss', 'clip_acc', 'ssl_acc']
     elif model.startswith('CLIP'):
         return ['loss', 'clip_loss', 'clip_acc']
+    elif model.startswith('TRIPLET'):
+        return []
     else:
         return ['loss', 'ssl_loss', 'ssl_acc']
 
@@ -337,3 +339,4 @@ def SLIP_VITL16(**kwargs):
 def TRIPLET(model_cfg_path, **kwargs):
     cfg = load_config(model_cfg_path)
     model = Triplet(cfg, device='cpu')
+    return model
