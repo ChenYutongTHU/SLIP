@@ -41,6 +41,7 @@ def get_args_parser():
     parser.add_argument('--output-dir', default='./', type=str, help='output dir')
     # Model
     parser.add_argument('--model', default='SLIP_VITB16', type=str)
+    parser.add_argument('--model_cfg_path', default='', type=str)
     parser.add_argument('--ssl-mlp-dim', default=4096, type=int,
                         help='hidden dim of SimCLR mlp projection head')
     parser.add_argument('--ssl-emb-dim', default=256, type=int,
@@ -102,7 +103,9 @@ def main(args):
 
     # create model
     print("=> creating model: {}".format(args.model))
-    model = getattr(models, args.model)(ssl_mlp_dim=args.ssl_mlp_dim, ssl_emb_dim=args.ssl_emb_dim)
+    model = getattr(models, args.model)(
+        ssl_mlp_dim=args.ssl_mlp_dim, ssl_emb_dim=args.ssl_emb_dim,
+        model_cfg_path=args.model_cfg_path)
     model.cuda(args.gpu)
 
     if args.distributed:
@@ -218,6 +221,7 @@ def main(args):
         len(train_loader) // args.update_freq, warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr_start)
 
     if utils.is_main_process() and args.wandb:
+        wandb.login(key='5421ff43bf1e3a6e19103432d161c885d4bbeda8')
         wandb_id = os.path.split(args.output_dir)[-1]
         wandb.init(project='slip', id=wandb_id, config=args, resume='allow')
 

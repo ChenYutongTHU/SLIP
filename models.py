@@ -329,3 +329,7 @@ def SLIP_VITL16(**kwargs):
         transformer_width=512, transformer_heads=8, transformer_layers=12, **kwargs)
 
     return model
+
+def TRIPLET(cfg_path, **kwargs):
+    cfg = load_config(cfg_path)
+    model = Triplet(cfg, device='cpu')

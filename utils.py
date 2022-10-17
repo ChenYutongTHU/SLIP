@@ -211,3 +211,14 @@ class GaussianBlur(object):
         sigma = random.uniform(self.sigma[0], self.sigma[1])
         x = x.filter(ImageFilter.GaussianBlur(radius=sigma))
         return x
+
+def load_config(path="configs/default.yaml") -> dict:
+    """
+    Loads and parses a YAML configuration file.
+    :param path: path to YAML configuration file
+    :return: configuration dictionary
+    """
+    import yaml
+    with open(path, "r", encoding="utf-8") as ymlfile:
+        cfg = yaml.safe_load(ymlfile)
+    return cfg
