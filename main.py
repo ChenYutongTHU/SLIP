@@ -229,7 +229,7 @@ def main(args):
     if utils.is_main_process() and args.wandb:
         wandb.login(key='5421ff43bf1e3a6e19103432d161c885d4bbeda8')
         wandb_id = os.path.split(args.output_dir)[-1]
-        wandb.init(project='slip', id=wandb_id, config=args)
+        wandb.init(project='slip', id=wandb_id, config=args, reinit=True)
 
     print(args)
 
