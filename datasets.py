@@ -56,9 +56,6 @@ class ImageCaptionDatasetBase(torch.utils.data.Dataset):
             self.samples = [(k, v) for k, v in samples.items()]
         elif self.dataset == 'cc12m' or self.dataset == 'cc3m':
             #self.samples = np.load(metadata, allow_pickle=True)
-            if not os.path.isfile(root) and '/data11/private/chenyutong/data' in root:
-                root = root.replace('/data11/private/chenyutong/data','../../../data/cc3m/')
-                print(f'training on itp instead of on thunlp, root={root}')
             self.tsv = TSVFile(root)
         elif self.dataset == 'redcaps':
             with open(metadata) as f:
