@@ -591,4 +591,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('SLIP training and evaluation', parents=[get_args_parser()])
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+    if not os.path.isfile(args.root) and '/data11/private/chenyutong/data' in args.root:
+        args.root = args.root.replace('/data11/private/chenyutong/data','../../../data/cc3m/')
+        print(f'training on itp instead of on thunlp, args.root={args.root}')
     main(args)
