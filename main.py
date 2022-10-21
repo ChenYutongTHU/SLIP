@@ -239,7 +239,6 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-
         # train for one epoch
         train_stats = train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args)
 
@@ -353,6 +352,8 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
 
         for k in loss_dict:
             metrics[k].update(loss_dict[k].item(), args.batch_size)
+        for k in acc_dict:
+            metrics[k].update(acc_dict[k], args.batch_size)            
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -363,7 +364,7 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         if optim_iter % args.print_freq == 0:
             if utils.is_main_process() and args.wandb:
                 wandb.log({**{f'loss/{k}': v.item() for k, v in loss_dict.items()},
-                        #**{f'acc/{k}': v.item() for k, v in loss_dict.items()},
+                        **{f'acc/{k}': v for k, v in acc_dict.items()},
                         'scaler': scaler.get_scale(),
                         'logit': logit_scale})
             progress.display(optim_iter)
@@ -378,7 +379,7 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
     model.eval()
     batch_time = AverageMeter('Time', ':6.3f')
     top1, top5 = {},{}
-    keys = ['zh','en', 'zh+en_prob']#, 'zh+en_feature']
+    keys = ['zh','en', 'zh+en_prob', 'zh^en_prob']#, 'zh+en_feature']
     for k in keys:
         top1[k] = AverageMeter(f'Acc@1_{k}', ':6.2f')
         top5[k] = AverageMeter(f'Acc@5_{k}', ':6.2f')
@@ -429,11 +430,19 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
                 top5[lang].update(acc5.item(), images.size(0))
 
             #bilingual ensemble
-            logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en']
+            logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en'] #B,V
             acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
             acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
             top1['zh+en_prob'].update(acc1.item(), images.size(0))
-            top5['zh+en_prob'].update(acc5.item(), images.size(0))            
+            top5['zh+en_prob'].update(acc5.item(), images.size(0))    
+
+            logits_per_image_bilingual =  torch.stack([logits_per_image['zh'],logits_per_image['en']], dim=-1)  #B,V,2
+            logits_per_image_bilingual = torch.max(logits_per_image_bilingual, dim=-1).values  
+            acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
+            acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+            top1['zh^en_prob'].update(acc1.item(), images.size(0))
+            top5['zh^en_prob'].update(acc5.item(), images.size(0))
+
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
