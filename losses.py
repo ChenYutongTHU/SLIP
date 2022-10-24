@@ -47,27 +47,21 @@ class ClipInfoCELoss2(_Loss):
             loss1 = F.cross_entropy(logits, labels1)
             loss2 = F.cross_entropy(logits, labels2)
             loss = loss1+loss2
-            preds = torch.argmax(logits, dim=-1)#bs,
-            acc1 = (torch.sum(preds==labels1))/bs
-            acc2 = (torch.sum(preds==labels2))/bs
-            acc1, acc2 = acc1.item(), acc2.item()
-           # print('labels1:', labels1, '    labels2:', labels2, end=' ')
-            #print('preds:', preds, 'acc1:{:.2f} acc2:{:.2f}'.format(acc1, acc2), end='\n')
-            return loss, acc1*100, acc2*100
         elif self.mode=='plus_log':
             target_id = torch.arange(l_bs, device=labels1.device).unsqueeze(0).tile(bs,1) #bs,l_bs
             labels1_, labels2_ = labels1[:,None], labels2[:,None] #bs, 1
-            target = ((target_id==labels1_)+(target_id==labels2_)).float() #bs, l_bs
-            nominator = torch.logsumexp(logits*target)
-            
-            loss = F.cross_entropy(logits, target)
-            preds = torch.argmax(logits, dim=-1)#bs,
-            acc1 = (torch.sum(preds==labels1))/bs
-            acc2 = (torch.sum(preds==labels2))/bs
-            print(target)
-            return loss, acc1, acc2
+            labels = torch.cat([labels1_, labels2_],dim=-1)
+            #target = ((target_id==labels1_)+(target_id==labels2_)).float() #bs, l_bs 128,2048
+            selected_logits = torch.gather(logits,dim=1,index=labels)
+            nominator = torch.logsumexp(selected_logits, dim=-1) #bs
+            denumerator = torch.logsumexp(logits, dim=-1) #bs
+            loss = torch.mean(denumerator- nominator) #AVERAGE on batch
         else:
             raise ValueError
+        preds = torch.argmax(logits, dim=-1)#bs,
+        acc1 = (torch.sum(preds==labels1))/bs
+        acc2 = (torch.sum(preds==labels2))/bs
+        return loss, (acc1*100).item(), (acc2*100).item()
         
 class CLIPLoss(nn.Module):
     def __init__(self):

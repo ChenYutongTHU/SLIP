@@ -86,7 +86,7 @@ class Triplet(torch.nn.Module):
         
         print('Logit_scale={:.2f}({}) Visual_proj={}'.format(self.logit_scale, cfg['logit_scale'], cfg['visual_proj']))
         self.contrastive_type = cfg['contrastive_type']
-        if self.contrastive_type=='one_one':
+        if self.contrastive_type in ['one_one','one_mean']:
             self.criterion = ClipInfoCELoss()
         elif self.contrastive_type=='one_two':
             self.criterion = ClipInfoCELoss2(mode=cfg.get('one_two_loss_mode','log_plus'))
@@ -192,6 +192,31 @@ class Triplet(torch.nn.Module):
                 loss_dict['total'] += (
                     loss_dict[f'{k1}->{k2}']*self.loss_weight[f'{k1}->{k2}']+ \
                         loss_dict[f'{k2}->{k1}']*self.loss_weight[f'{k2}->{k1}'])
+        elif self.contrastive_type=='one_mean':
+            for k0 in features_dict:
+                k1,k2 = sorted([k for k in features_dict if not k==k0])
+                f0 = features_dict[k0]  
+                gathered_f0 = gathered_features_dict[k0]
+
+                gathered_f1, gathered_f2 = gathered_features_dict[k1], gathered_features_dict[k2]
+                gathered_f12 = (gathered_f1+gathered_f2)/2
+                gathered_f12 = gathered_f12 / (gathered_f12.norm(dim=-1, keepdim=True)+1e-10)
+                
+                f1, f2 = features_dict[k1], features_dict[k2]
+                f12 = (f1+f2)/2
+                f12 = f12 / (f12.norm(dim=-1, keepdim=True)+1e-10)
+
+                if self.label_requires_grad==False:
+                    gathered_f0 = gathered_f0.detach()
+                    gathered_f12 = gathered_f12.detach()
+                logits1 = logit_scale*f0@gathered_f12.t()
+                logits2 = logit_scale*f12@gathered_f0.t()
+                loss1_2, loss2_1, acc1_2, acc2_1 = self.criterion(logits1, logits2)
+                acc_dict[f'{k0}->mean({k1},{k2})'], acc_dict[f'mean({k1},{k2})->{k0}'] = acc1_2, acc2_1
+                loss_dict[f'{k0}->mean({k1},{k2})'], loss_dict[f'mean({k1},{k2})->{k0}'] = loss1_2, loss2_1
+                loss_dict['total'] += (
+                    loss_dict[f'{k0}->mean({k1},{k2})']*self.loss_weight[f'{k0}->mean({k1},{k2})']+ \
+                        loss_dict[f'mean({k1},{k2})->{k0}']*self.loss_weight[f'mean({k1},{k2})->{k0}'])
         elif self.contrastive_type=='one_two':
             for k0 in features_dict:
                 f0 = features_dict[k0]    

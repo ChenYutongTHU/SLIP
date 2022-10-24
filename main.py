@@ -250,7 +250,10 @@ def main(args):
             acc1 = -1
         elif args.model.startswith('TRIPLET'):
             val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-            acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],val_stats['zh+en_prob_acc1'])
+            acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
+                        val_stats['zh+en_logits_acc1'], 
+                        val_stats['zh^en_logits_acc1'], 
+                        val_stats['zh+en_probs_acc1'])
         else:
             val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
             acc1 = val_stats['acc1']
@@ -379,7 +382,7 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
     model.eval()
     batch_time = AverageMeter('Time', ':6.3f')
     top1, top5 = {},{}
-    keys = ['zh','en', 'zh+en_prob', 'zh^en_prob']#, 'zh+en_feature']
+    keys = ['zh','en', 'zh+en_logits', 'zh^en_logits', 'zh+en_probs']#, 'zh+en_feature']
     for k in keys:
         top1[k] = AverageMeter(f'Acc@1_{k}', ':6.2f')
         top5[k] = AverageMeter(f'Acc@5_{k}', ':6.2f')
@@ -421,9 +424,10 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
             # cosine similarity as logits
-            logits_per_image = {}
+            logits_per_image, probs_per_image = {}, {}
             for lang, text_features in lang2text_features.items():
-                logits_per_image[lang] = image_features @ text_features.t()
+                logits_per_image[lang] = image_features @ text_features.t() #B,V
+                probs_per_image[lang] = torch.nn.functional.softmax(logits_per_image[lang],dim=-1) #B,V
                 acc1, acc5 = accuracy(logits_per_image[lang], target, topk=(1, 5))
                 acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
                 top1[lang].update(acc1.item(), images.size(0))
@@ -433,15 +437,22 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en'] #B,V
             acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
             acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-            top1['zh+en_prob'].update(acc1.item(), images.size(0))
-            top5['zh+en_prob'].update(acc5.item(), images.size(0))    
+            top1['zh+en_logits'].update(acc1.item(), images.size(0))
+            top5['zh+en_logits'].update(acc5.item(), images.size(0))    
 
             logits_per_image_bilingual =  torch.stack([logits_per_image['zh'],logits_per_image['en']], dim=-1)  #B,V,2
             logits_per_image_bilingual = torch.max(logits_per_image_bilingual, dim=-1).values  
             acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
             acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-            top1['zh^en_prob'].update(acc1.item(), images.size(0))
-            top5['zh^en_prob'].update(acc5.item(), images.size(0))
+            top1['zh^en_logits'].update(acc1.item(), images.size(0))
+            top5['zh^en_logits'].update(acc5.item(), images.size(0))
+
+            probs_per_image_bilingual = probs_per_image['zh']+probs_per_image['en'] #B,V
+            acc1, acc5 = accuracy(probs_per_image_bilingual, target, topk=(1, 5))
+            acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+            top1['zh+en_probs'].update(acc1.item(), images.size(0))
+            top5['zh+en_probs'].update(acc5.item(), images.size(0)) 
+
 
             # measure elapsed time
             batch_time.update(time.time() - end)
