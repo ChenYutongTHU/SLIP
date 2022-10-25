@@ -37,16 +37,43 @@ class ClipInfoCELoss2(_Loss):
     def forward(self, logits):
         bs, l_bs = logits.shape
         assert l_bs%2==0, logits.shape
-        if l_bs == bs*2:
+        if l_bs == bs*2: #gpu=1
             labels1 = torch.arange(bs).cuda()
             labels2 = bs+labels1
         else:
             labels1 = get_rank()*bs + torch.arange(bs).cuda()
             labels2 = labels1+ (bs*get_world_size())
-        if self.mode=='log_plus':
+
+        if self.mode=='single_positive':
+            N, r = get_world_size(), get_rank()
+            index1, index2 = [], []
+            for i in range(bs):
+                row1 = [torch.arange(labels2[i]), torch.arange(labels2[i]+1, l_bs)]
+                row2 = [torch.arange(labels1[i]), torch.arange(labels1[i]+1, l_bs)]
+                index1.append(torch.cat(row1,dim=0))
+                index2.append(torch.cat(row2,dim=0))
+            index1 = torch.stack(index1, dim=0).to(logits.device) #BS,l_bs-1
+            index2 = torch.stack(index2, dim=0).to(logits.device) #BS,l_bs-1
+            labels2 = labels2 - 1 #only one single positive pairs in the denominator
+
+            logits1 = torch.gather(logits, dim=1, index=index1)
+            logits2 = torch.gather(logits, dim=1, index=index2)
+            loss1 = F.cross_entropy(logits1, labels1)
+            loss2 = F.cross_entropy(logits2, labels1)
+            preds1 = torch.argmax(logits1, dim=-1)#bs,
+            preds2 = torch.argmax(logits2, dim=-1)#bs,
+            acc1 = (torch.sum(preds1==labels1))/bs
+            acc2 = (torch.sum(preds2==labels2))/bs
+            loss = loss1+loss2
+            #print(r, 'index1:', index1, 'index2:',index2, 'logits1.shape', logits1.shape, 'labels12', labels1, labels2)
+
+        elif self.mode=='log_plus':
             loss1 = F.cross_entropy(logits, labels1)
             loss2 = F.cross_entropy(logits, labels2)
             loss = loss1+loss2
+            preds = torch.argmax(logits, dim=-1)#bs,
+            acc1 = (torch.sum(preds==labels1))/bs
+            acc2 = (torch.sum(preds==labels2))/bs
         elif self.mode=='plus_log':
             target_id = torch.arange(l_bs, device=labels1.device).unsqueeze(0).tile(bs,1) #bs,l_bs
             labels1_, labels2_ = labels1[:,None], labels2[:,None] #bs, 1
@@ -56,11 +83,11 @@ class ClipInfoCELoss2(_Loss):
             nominator = torch.logsumexp(selected_logits, dim=-1) #bs
             denumerator = torch.logsumexp(logits, dim=-1) #bs
             loss = torch.mean(denumerator- nominator) #AVERAGE on batch
+            preds = torch.argmax(logits, dim=-1)#bs,
+            acc1 = (torch.sum(preds==labels1))/bs
+            acc2 = (torch.sum(preds==labels2))/bs
         else:
             raise ValueError
-        preds = torch.argmax(logits, dim=-1)#bs,
-        acc1 = (torch.sum(preds==labels1))/bs
-        acc2 = (torch.sum(preds==labels2))/bs
         return loss, (acc1*100).item(), (acc2*100).item()
         
 class CLIPLoss(nn.Module):
