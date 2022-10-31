@@ -1,5 +1,5 @@
 from utils import freeze_params, get_rank, unfreeze_params, get_world_size
-from losses import ClipInfoCELoss, ClipInfoCELoss2
+from losses import ClipInfoCELoss, ClipInfoCELoss2, ClipInfoCELoss_unidirectional
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
@@ -85,18 +85,35 @@ class Triplet(torch.nn.Module):
         del self.model_zh.logit_scale
         
         print('Logit_scale={:.2f}({}) Visual_proj={}'.format(self.logit_scale, cfg['logit_scale'], cfg['visual_proj']))
-        self.contrastive_type = cfg['contrastive_type']
-        if self.contrastive_type in ['one_one','one_mean']:
-            self.criterion = ClipInfoCELoss()
-        elif self.contrastive_type=='one_two':
-            self.criterion = ClipInfoCELoss2(mode=cfg.get('one_two_loss_mode','log_plus'))
-        
+        # self.contrastive_type = cfg['contrastive_type']
+        # if self.contrastive_type in ['one_one','one_mean']:
+        #     self.criterion = ClipInfoCELoss()
+        # elif self.contrastive_type=='one_two':
+        #     self.criterion = ClipInfoCELoss2(mode=cfg.get('one_two_loss_mode','log_plus'))
+           
         if 'loss_weight' in cfg:
-            self.loss_weight = cfg['loss_weight']
+            #adapt to new version
+            loss_weight_load  = {}
+            for k, v in cfg['loss_weight'].items():
+                if k in ['image','en_text','zh_text']:
+                    if k=='image':
+                        k = 'image->en_text|zh_text'
+                    elif k=='en_text':
+                        k = 'en_text->image|zh_text'
+                    else:
+                        k = 'zh_text->en_text|image'
+                    if 'one_two_loss_mode' in cfg:
+                        assert cfg['one_two_loss_mode'] in ['plus_log', 'log_plus', 'single_positive'], cfg['one_two_loss_mode']
+                        k = k+'#'+cfg['one_two_loss_mode']
+                else:
+                    pass
+                loss_weight_load[k] = v
+            self.loss_weight = defaultdict(lambda :0, loss_weight_load) 
             for k, v in self.loss_weight.items():
                 print('{}:{:.2f}'.format(k,v))
         else:
-            self.loss_weight = defaultdict(lambda :1)
+            self.loss_weight = defaultdict(lambda :0)
+            raise ValueError 
         self.label_requires_grad = cfg['label_requires_grad']
         
         #convert_weights(self)
@@ -177,60 +194,55 @@ class Triplet(torch.nn.Module):
                 gathered_features_dict[k] = self.all_gather(features_dict[k])    
         else:
             gathered_features_dict = features_dict
-        if self.contrastive_type=='one_one':
-            for k1,k2 in [['image','zh_text'],['image','en_text'],['zh_text', 'en_text']]:
-                f1, f2 = features_dict[k1], features_dict[k2]
-                gathered_f1, gathered_f2 = gathered_features_dict[k1], gathered_features_dict[k2]
-                if self.label_requires_grad==False:
-                    gathered_f1 = gathered_f1.detach()
-                    gathered_f2 = gathered_f2.detach()
-                logits1 = logit_scale*f1@gathered_f2.t()
-                logits2 = logit_scale*f2@gathered_f1.t()
-                loss1_2, loss2_1, acc1_2, acc2_1 = self.criterion(logits1, logits2)
-                acc_dict[f'{k1}->{k2}'], acc_dict[f'{k2}->{k1}'] = acc1_2, acc2_1
-                loss_dict[f'{k1}->{k2}'], loss_dict[f'{k2}->{k1}'] = loss1_2, loss2_1
-                loss_dict['total'] += (
-                    loss_dict[f'{k1}->{k2}']*self.loss_weight[f'{k1}->{k2}']+ \
-                        loss_dict[f'{k2}->{k1}']*self.loss_weight[f'{k2}->{k1}'])
-        elif self.contrastive_type=='one_mean':
-            for k0 in features_dict:
-                k1,k2 = sorted([k for k in features_dict if not k==k0])
-                f0 = features_dict[k0]  
-                gathered_f0 = gathered_features_dict[k0]
+        
+        for loss_key, loss_weight in self.loss_weight.items():
+            if '|' in loss_key:
+                #one-two loss
+                k0k1k2, one_two_loss_mode = loss_key.split('#')
+                k0, k1k2 = k0k1k2.split('->')
+                k1,k2 = sorted(k1k2.split('|'))
+                criterion = ClipInfoCELoss2(mode=one_two_loss_mode)
 
-                gathered_f1, gathered_f2 = gathered_features_dict[k1], gathered_features_dict[k2]
-                gathered_f12 = (gathered_f1+gathered_f2)/2
-                gathered_f12 = gathered_f12 / (gathered_f12.norm(dim=-1, keepdim=True)+1e-10)
-                
-                f1, f2 = features_dict[k1], features_dict[k2]
-                f12 = (f1+f2)/2
-                f12 = f12 / (f12.norm(dim=-1, keepdim=True)+1e-10)
-
-                if self.label_requires_grad==False:
-                    gathered_f0 = gathered_f0.detach()
-                    gathered_f12 = gathered_f12.detach()
-                logits1 = logit_scale*f0@gathered_f12.t()
-                logits2 = logit_scale*f12@gathered_f0.t()
-                loss1_2, loss2_1, acc1_2, acc2_1 = self.criterion(logits1, logits2)
-                acc_dict[f'{k0}->mean({k1},{k2})'], acc_dict[f'mean({k1},{k2})->{k0}'] = acc1_2, acc2_1
-                loss_dict[f'{k0}->mean({k1},{k2})'], loss_dict[f'mean({k1},{k2})->{k0}'] = loss1_2, loss2_1
-                loss_dict['total'] += (
-                    loss_dict[f'{k0}->mean({k1},{k2})']*self.loss_weight[f'{k0}->mean({k1},{k2})']+ \
-                        loss_dict[f'mean({k1},{k2})->{k0}']*self.loss_weight[f'mean({k1},{k2})->{k0}'])
-        elif self.contrastive_type=='one_two':
-            for k0 in features_dict:
                 f0 = features_dict[k0]    
-                k1,k2 = sorted([k for k in features_dict if not k==k0])
                 f12 = torch.cat([gathered_features_dict[k1], gathered_features_dict[k2]], dim=0)  
                 if self.label_requires_grad==False:
                     f12 = f12.detach()
-                #print(f0.dtype, f12.dtype)
                 logits = logit_scale*f0@f12.t()
-                #print('logit_scale ',logit_scale)
-                loss, acc1, acc2 = self.criterion(logits)
-                loss_dict[k0] = loss
-                loss_dict['total'] += loss_dict[k0]*self.loss_weight[k0]
-                acc_dict[f'{k0}->{k1}'], acc_dict[f'{k0}->{k2}'], acc_dict[f'{k0}->{k1}|{k2}'] = acc1, acc2, acc1+acc2
+                loss, acc1, acc2 = criterion(logits)
+                loss_dict[loss_key] = loss
+                loss_dict['total'] += loss_weight*loss
+                acc_dict[f'{k0}->{k1}({k1}|{k2})'], acc_dict[f'{k0}->{k2}({k1}|{k2})'], acc_dict[f'{k0}->{k1}|{k2}'] = acc1, acc2, acc1+acc2
+            else:
+                #one-one loss
+                criterion = ClipInfoCELoss_unidirectional()
+                if 'mean' in loss_key:
+                    if loss_key.find('->')<loss_key.find('mean'): #image->mean(en_text,zh_text)
+                        k0 = loss_key.split('->')[0]
+                        k1, k2 = sorted(loss_key[loss_key.find('mean(')+5:loss_key.find(')')].split(',')) 
+                        gathered_f1, gathered_f2 = gathered_features_dict[k1], gathered_features_dict[k2]
+                        gathered_f12 = (gathered_f1+gathered_f2)/2
+                        gathered_f12 = gathered_f12 / (gathered_f12.norm(dim=-1, keepdim=True)+1e-10)
+                        fs = features_dict[k0]
+                        gathered_ft = gathered_f12
+                    else: #mean(en_text,zh_text)->image
+                        k0 = loss_key.split('->')[1]
+                        k1, k2 = sorted(loss_key[loss_key.find('mean(')+5:loss_key.find(')')].split(','))                   
+                        f1, f2 = features_dict[k1], features_dict[k2]
+                        f12 = (f1+f2)/2
+                        f12 = f12 / (f12.norm(dim=-1, keepdim=True)+1e-10)
+                        fs = f12
+                        gathered_ft = gathered_features_dict[k0] 
+                else:
+                    k0, k1 = loss_key.split('->')[0], loss_key.split('->')[1]
+                    fs, ft = features_dict[k0], features_dict[k1]
+                    gathered_ft = gathered_features_dict[k1]
+                if self.label_requires_grad==False:
+                    gathered_ft = gathered_ft.detach()
+                logits = logit_scale*fs@gathered_ft.t()
+                loss, acc = criterion(logits)
+                loss_dict[loss_key] = loss
+                loss_dict['total'] += loss_weight*loss
+                acc_dict[loss_key] = acc         
         return loss_dict, features_dict, acc_dict
             
         

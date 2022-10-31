@@ -28,6 +28,7 @@ import datasets
 import models
 from tokenizer import SimpleTokenizer
 import utils
+from utils import get_rank, get_world_size
 
 
 def get_args_parser():
@@ -415,6 +416,12 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             lang2text_features[lang] = torch.stack(lang2text_features[lang], dim=0)
             end = time.time()
         
+        SAVE = False
+        if SAVE:
+            logits_output_zh, logits_output_en, targets = [], [], []
+        logit_scale = utils.get_model(model).logit_scale.exp()
+        logit_scale.data = torch.clamp(logit_scale.data, max=100)
+
         for i, (images, target) in enumerate(val_loader):
             images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
@@ -426,7 +433,8 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             # cosine similarity as logits
             logits_per_image, probs_per_image = {}, {}
             for lang, text_features in lang2text_features.items():
-                logits_per_image[lang] = image_features @ text_features.t() #B,V
+                #logits_per_image[lang] = logit_scale*image_features @ text_features.t() #B,V
+                logits_per_image[lang] = logit_scale*image_features @ text_features.t() 
                 probs_per_image[lang] = torch.nn.functional.softmax(logits_per_image[lang],dim=-1) #B,V
                 acc1, acc5 = accuracy(logits_per_image[lang], target, topk=(1, 5))
                 acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
@@ -434,6 +442,10 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
                 top5[lang].update(acc5.item(), images.size(0))
 
             #bilingual ensemble
+            if SAVE:
+                logits_output_zh.append(logits_per_image['zh'].cpu())
+                logits_output_en.append(logits_per_image['en'].cpu())
+                targets.append(target.cpu())
             logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en'] #B,V
             acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
             acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
@@ -461,6 +473,10 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
+        if SAVE:
+            torch.save(logits_output_en, os.path.join(args.output_dir,f'logits_en_rank{get_rank()}.bin'))
+            torch.save(logits_output_zh, os.path.join(args.output_dir,f'logits_zh_rank{get_rank()}.bin'))
+            torch.save(targets, os.path.join(args.output_dir,f'targets_rank{get_rank()}.bin'))
     progress.synchronize()
     return_dict = {}
     for k in keys:

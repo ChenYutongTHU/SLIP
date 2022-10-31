@@ -10,6 +10,22 @@ from torch.nn.modules.loss import _Loss
 import utils
 from utils import get_rank, get_world_size
 
+
+class ClipInfoCELoss_unidirectional(_Loss):
+    def __init__(self):
+        super(ClipInfoCELoss_unidirectional, self).__init__()
+    def forward(self, logits):
+        bs, l_bs = logits.shape
+        if l_bs == bs:
+            labels = torch.arange(len(logits)).cuda()
+        else:
+            labels = get_rank() * bs + torch.arange(0, bs, dtype=torch.long).cuda()
+
+        loss = F.cross_entropy(logits, labels)        
+        pred = torch.argmax(logits, dim=-1) #bs,
+        acc = (torch.sum(pred==labels)/bs).item()
+        return loss, acc*100
+
 class ClipInfoCELoss(_Loss):
     def __init__(self):
         super(ClipInfoCELoss, self).__init__()
