@@ -149,6 +149,32 @@ class TripletDataset(torch.utils.data.Dataset):
         zh = self.tokenizer['zh'](zh)
         return {'img':image, 'en':en, 'zh':zh}
 
+class TripletDataset_from_rawfile(torch.utils.data.Dataset):
+    def __init__(self, img_file, zh, en, preprocess, tokenizer):
+        super().__init__()
+        self.img_file = img_file
+        self.zh, self.en = zh, en
+        self.preprocess = preprocess
+        self.tokenizer = tokenizer
+        assert len(self.img_file)==len(self.zh) and len(self.zh)==len(self.en)
+    
+    def __len__(self):
+        return len(self.img_file)
+    
+    def __getitem__(self, index):
+        image = Image.open(self.img_file[index])
+        image_arr = np.array(image)
+        if image_arr.shape[-1]!=3:
+            if len(image_arr.shape)==2:
+                image_arr = image_arr[:,:,None]
+            image_arr = np.tile(image_arr, [1,1,3])  
+        image = Image.fromarray(image_arr)     
+        image = self.preprocess(image)
+
+        en = self.tokenizer['en'](self.en[index])
+        zh = self.tokenizer['zh'](self.zh[index])        
+        return image, en, zh
+
 class ImageCaptionDatasetSLIP(ImageCaptionDatasetBase):
     def __init__(self, dataset, root, metadata, transform, augment, tokenizer=None):
         super().__init__(dataset, root, metadata)

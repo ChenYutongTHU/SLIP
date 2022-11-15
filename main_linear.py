@@ -21,7 +21,7 @@ import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
-
+from visual_cls import Vit_cls
 import datasets
 import utils
 
@@ -30,7 +30,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser(description='Linear probe evaluation', add_help=False)
     parser.add_argument('--dataset', default='imagenet', help='dataset name')
     parser.add_argument('--output-dir', default='./', type=str)
-    parser.add_argument('-a', '--arch', metavar='ARCH', default='vit_base_patch16_224',
+    parser.add_argument('-a', '--arch', metavar='ARCH', default='vit_base_patch32_224',
                         help='model architecture: (default: ViT-B/16)')
     parser.add_argument('-j', '--workers', default=64, type=int, metavar='N',
                         help='number of data loading workers (default: 64)')
@@ -70,6 +70,7 @@ def get_args_parser():
                         help='GPU id to use.')
     parser.add_argument('--pretrained', default='', type=str,
                         help='path to CLIP pretrained checkpoint')
+        
     return parser
 
 best_acc1 = 0
@@ -106,10 +107,11 @@ def main(args):
         # rename CLIP pre-trained keys
         state_dict = checkpoint['state_dict']
         for k in list(state_dict.keys()):
-            # retain only base_encoder up to before the embedding layer
+            # retain only base_encoder up to before the embedding layer (visual.head? created by timm)
             if k.startswith(visual_keyword) and not k.startswith(visual_keyword + linear_keyword):
                 # remove prefix
-                state_dict[k[len(visual_keyword):]] = state_dict[k]
+                state_dict[k.replace('module.','')] = state_dict[k]
+                #state_dict[k[len(visual_keyword):]] = state_dict[k]
             # delete renamed or unused k
             del state_dict[k]
     else:
@@ -117,11 +119,11 @@ def main(args):
 
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = timm.models.create_model(args.arch, num_classes=1000)
-
+    #timm.models.create_model(args.arch, num_classes=1000)
+    model = Vit_cls(args.arch, num_classes=1000)
     args.start_epoch = 0
     msg = model.load_state_dict(state_dict, strict=False)
-    assert set(msg.missing_keys) == {"%s.weight" % linear_keyword, "%s.bias" % linear_keyword}
+    assert set(msg.missing_keys) == {"%s.weight" % linear_keyword, "%s.bias" % linear_keyword}, msg.missing_keys
 
     # freeze all layers but the last fc
     for name, param in model.named_parameters():

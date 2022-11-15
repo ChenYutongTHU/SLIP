@@ -54,8 +54,8 @@ class Triplet(torch.nn.Module):
         if cfg.get('from_scratch', False):
             print('Reinitialize model')
             self.model_zh.initialize_parameters()
-            self.model_en.initialize_parameters()
-                        
+            self.model_en.initialize_parameters() 
+
         if cfg['visual_proj'] == 'scratch':
             width = self.visual.conv1.out_channels
             scale = width ** -0.5
@@ -90,7 +90,34 @@ class Triplet(torch.nn.Module):
         #     self.criterion = ClipInfoCELoss()
         # elif self.contrastive_type=='one_two':
         #     self.criterion = ClipInfoCELoss2(mode=cfg.get('one_two_loss_mode','log_plus'))
-           
+        
+        if cfg.get('share_text_encoder',False)==True:
+            print('Share text encoder')
+            # del self.model_zh
+            # self.model_zh = self.model_en    
+            assert self.model_zh.context_length<=self.model_en.context_length #32,77
+            assert cfg.get('from_scratch', False)==True
+            del self.model_zh.transformer 
+            del self.model_zh.positional_embedding
+            del self.model_zh.ln_final
+            self.model_zh.transformer = self.model_en.transformer
+            self.model_zh.positional_embedding = self.model_en.positional_embedding
+            self.model_zh.ln_final = self.model_en.ln_final
+            self.model_zh.context_length = self.model_en.context_length #77
+            from wukong.simple_tokenizer_wukong import set_tokenizer_lang
+            self.tokenize_zh._tokenizer = set_tokenizer_lang(lang='zh', context_length=self.model_en.context_length)
+            #language-specific: token_embedding/text_projection
+
+            # #re-initialize positional embedding, token_embedding and tokenizer
+            # context_length = max(self.model_zh.context_length, self.model_en.context_length)
+            # print('Shared text encoder, set context_length={}'.format(context_length)) 
+            # self.model_en.context_length = context_length
+            # self.model_en.positional_embedding = nn.Parameter(torch.empty(self.model_en.context_length, self.model_en.transformer_width))
+            # nn.init.normal_(self.model_en.positional_embedding, std=0.01)
+            # #two token_embedding #[CLS]? [EOS]?
+
+
+
         if 'loss_weight' in cfg:
             #adapt to new version
             loss_weight_load  = {}
@@ -172,6 +199,7 @@ class Triplet(torch.nn.Module):
             
     def forward(self, img, en, zh):
         image_features = self.encode_image(img)
+
         # print('image_features', torch.max(torch.isnan(image_features)))
         image_features = image_features / (image_features.norm(dim=-1, keepdim=True))
         

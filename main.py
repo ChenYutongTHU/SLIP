@@ -7,6 +7,7 @@ import argparse
 from collections import OrderedDict
 import json
 import math
+from multiprocessing import synchronize
 import os
 import sys
 import time
@@ -28,7 +29,9 @@ import datasets
 import models
 from tokenizer import SimpleTokenizer
 import utils
-from utils import get_rank, get_world_size
+from utils import get_rank, get_world_size, is_main_process
+from PIL import Image
+from tqdm import tqdm
 
 
 def get_args_parser():
@@ -76,6 +79,7 @@ def get_args_parser():
     parser.add_argument('-j', '--workers', default=10, type=int, metavar='N',
                         help='number of data loading workers per process')
     parser.add_argument('--evaluate', action='store_true', help='eval only')
+    parser.add_argument('--evaluate_retrieval', action='store_true', help='eval only')
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of nodes for distributed training')
     parser.add_argument('--rank', default=0, type=int,
@@ -94,7 +98,6 @@ best_acc1 = 0
 
 def main(args):
     utils.init_distributed_mode(args)
-
     global best_acc1
 
     # fix the seed for reproducibility
@@ -216,7 +219,10 @@ def main(args):
             print('zero-shot evaluation not supported with ssl-only model.')
             return
         elif args.model.startswith('TRIPLET'):
-            zero_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+            if args.evaluate_retrieval:
+                zero_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+            else:
+                zero_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
         else:
             zero_stats = validate_zeroshot(val_loader, model, tokenizer, args)
         if utils.is_main_process():
@@ -378,6 +384,71 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
             'lr': optimizer.param_groups[0]['lr'],
             'logit_scale': logit_scale}
 
+def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
+    model.eval()
+    DATASET2FILE = {
+        'coco-cn': 'data/coco_cn/coco_cn_test.json', #{'img_id':{'zh':,'en':}}
+    }
+    DATASET2IMG = {
+        'coco-cn': 'data/coco_cn/coco_cn_test_images/{}.jpg' #.format(img_id)
+    }
+    if utils.is_main_process(): #one gpu is enough
+        for dataset in ['coco-cn']:
+            print(f'Evaluate Img<->Text Retrieval on {dataset} ...')
+            with open(DATASET2FILE[dataset],'r') as f:
+                img2captions = json.load(f)
+
+            img_ids, zh_caps, en_caps = [], [], []
+            img_files = []
+            for img_id, c in img2captions.items():
+                img_ids.append(img_id)
+                img_files.append(DATASET2IMG[dataset].format(img_id))
+                zh_caps.append(c['zh'])
+                en_caps.append(c['en'])
+
+            val_dataset = datasets.TripletDataset_from_rawfile(
+                img_file=img_files, zh=zh_caps, en=en_caps, preprocess=val_transform, tokenizer=tokenizer)
+            val_dataloader = torch.utils.data.DataLoader(
+                val_dataset, batch_size=args.batch_size, shuffle=False,
+                    num_workers=args.workers, pin_memory=True, drop_last=False)
+
+            print('Compute embeddings ... ')
+            image_embeddings_all = []
+            en_embeddings_all, zh_embeddings_all = [], []
+            for img, en, zh in tqdm(val_dataloader):
+                en, zh = en.squeeze(1), zh.squeeze(1)
+                with torch.no_grad():
+                    image_features = utils.get_model(model).encode_image(img.cuda())
+                    en_embeddings = utils.get_model(model).model_en.encode_text(en.cuda())
+                    zh_embeddings = utils.get_model(model).model_zh.encode_text(zh.cuda())
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                en_embeddings = en_embeddings / en_embeddings.norm(dim=-1, keepdim=True)
+                zh_embeddings = zh_embeddings / zh_embeddings.norm(dim=-1, keepdim=True)
+                image_embeddings_all.append(image_features)
+                en_embeddings_all.append(en_embeddings)
+                zh_embeddings_all.append(zh_embeddings)
+            image_embeddings_all = torch.cat(image_embeddings_all, dim=0)
+            en_embeddings_all = torch.cat(en_embeddings_all, dim=0)
+            zh_embeddings_all = torch.cat(zh_embeddings_all, dim=0) #1k, 512
+            text_embeddings = {'zh': zh_embeddings_all, 'en':en_embeddings_all}
+
+            for lang in ['zh','en']:
+                sim = image_embeddings_all@text_embeddings[lang].t() #1k img, 1k text
+                print(sim.shape)
+                torch.save(sim.cpu(), 'debug_sim.bin')
+                for direction in ['Image->Text','Text->Image']:
+                    if direction=='Text->Image':
+                        sim_ = sim.t() #text image
+                    else:
+                        sim_ = sim
+                    pred_topk = torch.topk(sim_, k=5, dim=-1).indices #1k, 5 label: 0,1,2,3,4
+                    label = torch.arange(image_embeddings_all.shape[0])[:,None].cuda() #1k,1
+                    acc1 = torch.mean((pred_topk[:,0:1]==label).float())
+                    acc5 = torch.mean(torch.max((pred_topk==label).float(),dim=-1).values)
+                    acc1, acc5 = (acc1*100).item(), (acc5*100).item()
+                    print('{}({}) acc1={:.2f} acc5={:.2f}'.format(direction, lang, acc1, acc5))
+    dist.barrier()
+    model.train()
 
 def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
     model.eval()
@@ -416,13 +487,13 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             lang2text_features[lang] = torch.stack(lang2text_features[lang], dim=0)
             end = time.time()
         
-        SAVE = False
+        SAVE = True
         if SAVE:
-            logits_output_zh, logits_output_en, targets = [], [], []
+            fname2logits = {}
         logit_scale = utils.get_model(model).logit_scale.exp()
         logit_scale.data = torch.clamp(logit_scale.data, max=100)
 
-        for i, (images, target) in enumerate(val_loader):
+        for i, (images, target, fnames) in enumerate(val_loader):
             images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
 
@@ -443,9 +514,9 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
 
             #bilingual ensemble
             if SAVE:
-                logits_output_zh.append(logits_per_image['zh'].cpu())
-                logits_output_en.append(logits_per_image['en'].cpu())
-                targets.append(target.cpu())
+                for fname, logits_zh, logits_en in zip(fnames, logits_per_image['zh'], logits_per_image['en']):
+                    fname2logits[fname] = {'zh':logits_zh.cpu(), 'en':logits_en.cpu()}
+
             logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en'] #B,V
             acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
             acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
@@ -474,9 +545,8 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
                 progress.display(i)
 
         if SAVE:
-            torch.save(logits_output_en, os.path.join(args.output_dir,f'logits_en_rank{get_rank()}.bin'))
-            torch.save(logits_output_zh, os.path.join(args.output_dir,f'logits_zh_rank{get_rank()}.bin'))
-            torch.save(targets, os.path.join(args.output_dir,f'targets_rank{get_rank()}.bin'))
+            torch.save(fname2logits, os.path.join(args.output_dir,f'fname2logits_rank{get_rank()}.bin'))
+
     progress.synchronize()
     return_dict = {}
     for k in keys:
