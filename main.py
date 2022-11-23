@@ -436,8 +436,6 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
 
             for lang in ['zh','en']:
                 sim = image_embeddings_all@text_embeddings[lang].t() #1k img, 1k text
-                print(sim.shape)
-                torch.save(sim.cpu(), 'debug_sim.bin')
                 for direction in ['Image->Text','Text->Image']:
                     if direction=='Text->Image':
                         sim_ = sim.t() #text image

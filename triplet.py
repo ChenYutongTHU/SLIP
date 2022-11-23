@@ -300,7 +300,6 @@ class Triplet(torch.nn.Module):
                 logits = logit_scale*fs@gathered_ft.t()
                 loss, acc = criterion(logits)
                 loss_dict[loss_key] = loss
-                print(loss_key, loss.item())
                 loss_dict['total'] += loss_weight*loss
                 acc_dict[loss_key] = acc         
         return loss_dict, features_dict, acc_dict

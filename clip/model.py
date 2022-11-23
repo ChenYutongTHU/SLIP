@@ -191,8 +191,7 @@ class ResidualAttentionBlock(nn.Module):
             attn_mask = torch.tile(attn_mask.unsqueeze(1), [self.n_head,L,1]) #b,L -> b*HEAD, L, L
             if self.attn_mask!=None:
                 self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None #l,l
-                self.attn_mask = self.attn_mask.unsqueeze(0) #1,L,L
-                attn_mask = self.attn_mask + attn_mask #(1,L,L)+(b*head,L,l)           
+                attn_mask = self.attn_mask.unsqueeze(0) + attn_mask #(1,L,L)+(b*head,L,l)           
             y = self.attn(x, x, x, need_weights=True, attn_mask=attn_mask)
             return y
     
