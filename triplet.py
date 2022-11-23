@@ -176,7 +176,7 @@ class Triplet(torch.nn.Module):
                 context_length=self.model_en.context_length+self.model_zh.context_length)
             self.x_attn_encoder.initialize_parameters() 
         else:
-            self.self_attn_layers = self.model_zh.transformer.layers-1
+            self.self_attn_layers = -1
             self.x_attn_encoder = None
 
     def build_attention_mask(self):
