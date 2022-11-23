@@ -428,7 +428,7 @@ class CLIP(nn.Module):
         else:
             return image_embed
 
-    def encode_text(self, text, n_layer_1):
+    def encode_text(self, text, n_layer_1=-1):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)

@@ -219,7 +219,7 @@ class Triplet(torch.nn.Module):
         zh_text_features, zh_text_features_imme, zh_eot = self.model_zh.encode_text(zh, self.self_attn_layers)
         zh_text_features = self.normalize(zh_text_features, eps=1e-10)
         en_text_features, en_text_features_imme, en_eot = self.model_en.encode_text(en, self.self_attn_layers)
-        zh_text_features = self.normalize(en_text_features, eps=1e-10)
+        en_text_features = self.normalize(en_text_features, eps=1e-10)
         
         if self.x_attn_encoder is not None:
             bi_text_features = self.x_attn_encoder(zh=zh_text_features_imme, en=en_text_features_imme,
