@@ -168,6 +168,7 @@ class ResidualAttentionBlock(nn.Module):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.n_head = n_head
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
@@ -177,16 +178,29 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
-    def attention(self, x: torch.Tensor):
+    def attention(self, x: torch.Tensor, attn_mask=None):
         # self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         # return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=True, attn_mask=self.attn_mask)
-    def forward(self, x: torch.Tensor):
+
+        if attn_mask==None:
+            self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+            return self.attn(x, x, x, need_weights=True, attn_mask=self.attn_mask)
+        else:
+            B, L = attn_mask.shape
+            attn_mask = attn_mask.to(dtype=x.dtype, device=x.device) if attn_mask is not None else None
+            attn_mask = torch.tile(attn_mask.unsqueeze(1), [self.n_head,L,1]) #b,L -> b*HEAD, L, L
+            if self.attn_mask!=None:
+                self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None #l,l
+                self.attn_mask = self.attn_mask.unsqueeze(0) #1,L,L
+                attn_mask = self.attn_mask + attn_mask #(1,L,L)+(b*head,L,l)           
+            y = self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)
+            return y
+    
+    def forward(self, x: torch.Tensor, attn_mask=None):
         # x = x + self.attention(self.ln_1(x))
         # x = x + self.mlp(self.ln_2(x))
         # return x
-        attn_output, attn_weights = self.attention(self.ln_1(x)) #attn_weight B, H, L, S
+        attn_output, attn_weights = self.attention(self.ln_1(x), attn_mask=attn_mask) #attn_weight B, H, L, S
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
         return x, attn_weights
@@ -197,15 +211,18 @@ class Transformer(nn.Module):
         super().__init__()
         self.width = width
         self.layers = layers
+        self.heads = heads
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, attn_mask=None):
         #return self.resblocks(x)
         layers_attn_weights = []
+        xs = []
         for i in range(self.layers):
-            x, attn_weights = self.resblocks[i](x)
+            x, attn_weights = self.resblocks[i](x, attn_mask)
             layers_attn_weights.append(attn_weights)
-        return x, layers_attn_weights
+            xs.append(x)
+        return xs, layers_attn_weights
 
 class VisionTransformer(nn.Module):
     def __init__(self, 
@@ -237,7 +254,7 @@ class VisionTransformer(nn.Module):
 
         x = x.permute(1, 0, 2)  # NLD -> LND
         x, attention_weights = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = x[-1].permute(1, 0, 2)  # LND -> NLD (last layer)
 
         x = self.ln_post(x)
 
@@ -246,7 +263,63 @@ class VisionTransformer(nn.Module):
 
         return x
 
+class X_Attn_Encoder(nn.Module):
+    def __init__(self,
+        layers, width, heads, embed_dim,
+        context_length, causal_attn, order):
+        super().__init__()
+        self.context_length, self.order = context_length, order
+        self.transformer = Transformer(
+                width=width, layers=layers, heads=heads,
+                attn_mask=self.build_attention_mask() if causal_attn else None) #still causal mask (L,L)
+        self.ln_final = LayerNorm(width)
+        self.text_projection = nn.Parameter(
+                torch.empty(width, embed_dim))
+    
+    @property
+    def dtype(self):
+        return self.text_projection.dtype
+    
+    def initialize_parameters(self):
+        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
+        attn_std = self.transformer.width ** -0.5
+        fc_std = (2 * self.transformer.width) ** -0.5
+        for block in self.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+        if self.text_projection is not None:
+            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
+    def forward(self, zh, en, zh_eot, en_eot):
+        def build_attn_mask(txt, eot):
+            L, B, D = txt.shape
+            loc = torch.tile(torch.arange(L)[None,:],[B,1]).to(eot.device) #B,1
+            attn_mask = torch.where(loc<=eot[:,None], 0, float('-inf')) #!!<= include eot
+            return attn_mask
+        zh_attn_mask = build_attn_mask(zh, zh_eot)
+        en_attn_mask = build_attn_mask(en, en_eot)
+        if self.order == 'zh_en': #(no need to permute)
+            bi_text_features_imme = torch.cat([zh, en], dim=0) #L1+L2,N,D
+            bi_text_attn_mask = torch.cat([zh_attn_mask, en_attn_mask], dim=-1) #B,L1+L2
+            bi_eot = zh.shape[0]+en_eot #B,
+        else:
+            bi_text_features_imme = torch.cat([en, zh], dim=0) #L1+L2,N,D
+            bi_text_attn_mask = torch.cat([en_attn_mask, zh_attn_mask], dim=-1) #B,L1+L2 
+            bi_eot = en.shape[0]+zh_eot #B,
+        x, _ = self.transformer(bi_text_features_imme, bi_text_attn_mask)
+        x = x[-1].permute(1,0,2) #(permute back N,L,D)
+        x = self.ln_final(x).type(self.dtype)
+        x = x[torch.arange(x.shape[0]), bi_eot]@self.text_projection
+        return x
+    
+    def build_attention_mask(self):
+        mask = torch.empty(self.context_length, self.context_length)
+        mask.fill_(float("-inf"))
+        mask.triu_(1)  # zero out the lower diagonal
+        return mask
+    
 class CLIP(nn.Module):
     def __init__(self,
                  embed_dim: int,
@@ -266,6 +339,7 @@ class CLIP(nn.Module):
         super().__init__()
 
         self.context_length = context_length
+        self.embed_dim = embed_dim
         self.return_full_embed = return_full_embed
         if isinstance(vision_layers, (tuple, list)):
             vision_heads = vision_width * 32 // 64
@@ -295,6 +369,7 @@ class CLIP(nn.Module):
         )
 
         self.vocab_size = vocab_size
+        self.transformer_width = transformer_width
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
         self.ln_final = LayerNorm(transformer_width)
@@ -353,24 +428,27 @@ class CLIP(nn.Module):
         else:
             return image_embed
 
-    def encode_text(self, text):
+    def encode_text(self, text, n_layer_1):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x, _ = self.transformer(x)
+        xs, _ = self.transformer(x)
+        x = xs[-1]
+        x_1 = xs[n_layer_1]
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         # x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        eot_loc = torch.sum(text!=0, dim=-1)-1 #B
+        #print('build attn_mask', attn_mask.shape, attn_mask)
         if self.return_full_embed==False:
-            eot_loc = torch.sum(text!=0, dim=-1) #B,L -> B
-            x = x[torch.arange(x.shape[0]), eot_loc-1] @ self.text_projection
+            x = x[torch.arange(x.shape[0]), eot_loc] @ self.text_projection
         else:
             x = x@self.text_projection
-        return x
+        return x, x_1, eot_loc
 
     def forward(self, image, text):
         image_features = self.encode_image(image)

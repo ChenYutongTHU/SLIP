@@ -119,7 +119,7 @@ def main(args):
 
     # create model
     print("=> creating model '{}'".format(args.arch))
-    #timm.models.create_model(args.arch, num_classes=1000)
+    #timm.models.create_model(args.arch, num_classes=1000) #fc_norm = None?
     model = Vit_cls(args.arch, num_classes=1000)
     args.start_epoch = 0
     msg = model.load_state_dict(state_dict, strict=False)
@@ -363,6 +363,8 @@ def validate(val_loader, model, criterion, args):
 def save_checkpoint(state, is_best, output_dir):
     ckpt_path = f'{output_dir}/linear_checkpoint.pt'
     best_path = f'{output_dir}/linear_best.pt'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     torch.save(state, ckpt_path)
     if is_best:
         shutil.copyfile(ckpt_path, best_path)

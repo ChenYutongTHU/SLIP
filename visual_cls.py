@@ -20,7 +20,12 @@ class Vit_cls(torch.nn.Module):
         )
         self.head = torch.nn.Linear(embed_dim, num_classes)
         del self.visual.proj
-        
+        self.visual.proj = None
+    @property
+    def dtype(self):
+        return self.visual.conv1.weight.dtype
+        #return self.text_projection.dtype
+
     def forward(self, images):
         image_embed = self.visual(images.type(self.dtype))
         logits = self.head(image_embed[:,0,:])

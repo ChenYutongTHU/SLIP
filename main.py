@@ -195,7 +195,9 @@ def main(args):
         root = json.load(f)['imagenet']['path']
     val_dataset = ImageFolder(os.path.join(root, 'val'), val_transform)
     '''
-    val_dataset = ImageNetValDataset(transform=val_transform, location='../CLIP_distillation')
+    val_dataset = ImageNetValDataset(
+        transform=val_transform, 
+        location='../CLIP_distillation')
 
     # dist eval resamples data to pad uneven batch sizes
     # make sure num_samples = 0 mod num_gpus for exact acc

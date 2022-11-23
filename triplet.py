@@ -5,9 +5,11 @@ import torch.nn.functional as F
 import torch
 from collections import defaultdict
 import wukong, clip
+from clip.model import Transformer, X_Attn_Encoder
 from copy import deepcopy
 import numpy as np
 import torch.distributed as dist
+
 
 class AllGather(torch.autograd.Function):
     
@@ -108,14 +110,6 @@ class Triplet(torch.nn.Module):
             self.tokenize_zh._tokenizer = set_tokenizer_lang(lang='zh', context_length=self.model_en.context_length)
             #language-specific: token_embedding/text_projection
 
-            # #re-initialize positional embedding, token_embedding and tokenizer
-            # context_length = max(self.model_zh.context_length, self.model_en.context_length)
-            # print('Shared text encoder, set context_length={}'.format(context_length)) 
-            # self.model_en.context_length = context_length
-            # self.model_en.positional_embedding = nn.Parameter(torch.empty(self.model_en.context_length, self.model_en.transformer_width))
-            # nn.init.normal_(self.model_en.positional_embedding, std=0.01)
-            # #two token_embedding #[CLS]? [EOS]?
-
 
 
         if 'loss_weight' in cfg:
@@ -171,7 +165,28 @@ class Triplet(torch.nn.Module):
             for n, p in self.named_parameters():
                 if p.requires_grad==True:
                     print(n)
-                    
+        
+        if 'x_attn_encoder' in cfg:
+            self.self_attn_layers = self.model_zh.transformer.layers-cfg['x_attn_encoder']['layers']
+            self.x_attn_encoder = X_Attn_Encoder(
+                **cfg['x_attn_encoder'], 
+                width=self.model_en.transformer.width, 
+                heads=self.model_en.transformer.heads,
+                embed_dim=self.model_en.embed_dim, 
+                context_length=self.model_en.context_length+self.model_zh.context_length)
+            self.x_attn_encoder.initialize_parameters() 
+        else:
+            self.self_attn_layers = self.model_zh.transformer.layers-1
+            self.x_attn_encoder = None
+
+    def build_attention_mask(self):
+        # lazily create causal attention mask, with full attention between the vision tokens
+        # pytorch uses additive attention mask; fill with -inf
+        mask = torch.empty(self.bi_context_length, self.bi_context_length)
+        mask.fill_(float("-inf"))
+        mask.triu_(1)  # zero out the lower diagonal
+        return mask
+    
     def model_weights_check(self):
         assert self.model_zh.visual.input_resolution == self.model_en.visual.input_resolution, (self.model_zh.visual.input_resolution, self.model_en.visual.input_resolution)
         zh_visual_dict = self.model_zh.visual.state_dict()
@@ -196,24 +211,39 @@ class Triplet(torch.nn.Module):
         img_x = self.visual(img.type(self.model_en.dtype))[:,0,:] #B,D
         image_features = img_x @ self.visual_proj
         return image_features
-            
+    
+    def normalize(self, x, eps=0):
+        return x/(x.norm(dim=-1, keepdim=True)+eps)
+    
+    def encode_text(self, zh, en):
+        zh_text_features, zh_text_features_imme, zh_eot = self.model_zh.encode_text(zh, self.self_attn_layers)
+        zh_text_features = self.normalize(zh_text_features, eps=1e-10)
+        en_text_features, en_text_features_imme, en_eot = self.model_en.encode_text(en, self.self_attn_layers)
+        zh_text_features = self.normalize(en_text_features, eps=1e-10)
+        
+        if self.x_attn_encoder is not None:
+            bi_text_features = self.x_attn_encoder(zh=zh_text_features_imme, en=en_text_features_imme,
+                    zh_eot=zh_eot, en_eot=en_eot)
+            bi_text_features = self.normalize(bi_text_features)
+        else:
+            bi_text_features = None
+        return zh_text_features, en_text_features, bi_text_features
+
     def forward(self, img, en, zh):
         image_features = self.encode_image(img)
+        image_features = self.normalize(image_features)
 
-        # print('image_features', torch.max(torch.isnan(image_features)))
-        image_features = image_features / (image_features.norm(dim=-1, keepdim=True))
-        
-        zh_text_features = self.model_zh.encode_text(zh)
-        zh_text_features = zh_text_features / (zh_text_features.norm(dim=-1, keepdim=True)+1e-10)
-        en_text_features = self.model_en.encode_text(en)
-        en_text_features = en_text_features / (en_text_features.norm(dim=-1, keepdim=True)+1e-10)
+        zh_text_features, en_text_features, bi_text_features = self.encode_text(zh, en)
 
         logit_scale = self.logit_scale.exp()
         logit_scale.data = torch.clamp(logit_scale.data, max=100)
-        
+
         features_dict = {'image': image_features, 
                          'zh_text': zh_text_features,
                          'en_text': en_text_features}
+        if bi_text_features is not None:
+            features_dict['bi_text'] = bi_text_features
+
         loss_dict = {'total':0}
         acc_dict = {}
         if self.training and self.use_allgather:
@@ -226,6 +256,7 @@ class Triplet(torch.nn.Module):
         for loss_key, loss_weight in self.loss_weight.items():
             if '|' in loss_key:
                 #one-two loss
+                assert 'bi_text' in features_dict, 'do not support one-two loss for x_attn'
                 k0k1k2, one_two_loss_mode = loss_key.split('#')
                 k0, k1k2 = k0k1k2.split('->')
                 k1,k2 = sorted(k1k2.split('|'))
@@ -269,6 +300,7 @@ class Triplet(torch.nn.Module):
                 logits = logit_scale*fs@gathered_ft.t()
                 loss, acc = criterion(logits)
                 loss_dict[loss_key] = loss
+                print(loss_key, loss.item())
                 loss_dict['total'] += loss_weight*loss
                 acc_dict[loss_key] = acc         
         return loss_dict, features_dict, acc_dict
