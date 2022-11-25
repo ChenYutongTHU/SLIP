@@ -416,25 +416,29 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
 
             print('Compute embeddings ... ')
             image_embeddings_all = []
-            en_embeddings_all, zh_embeddings_all = [], []
+            en_embeddings_all, zh_embeddings_all, bi_embeddings_all = [], [], []
             for img, en, zh in tqdm(val_dataloader):
                 en, zh = en.squeeze(1), zh.squeeze(1)
                 with torch.no_grad():
                     image_features = utils.get_model(model).encode_image(img.cuda())
-                    en_embeddings = utils.get_model(model).model_en.encode_text(en.cuda())
-                    zh_embeddings = utils.get_model(model).model_zh.encode_text(zh.cuda())
+                    zh_embeddings, en_embeddings, bi_embeddings = \
+                        utils.get_model(model).encode_text(zh=zh.cuda(), en=en.cuda()) #already normalize
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                en_embeddings = en_embeddings / en_embeddings.norm(dim=-1, keepdim=True)
-                zh_embeddings = zh_embeddings / zh_embeddings.norm(dim=-1, keepdim=True)
                 image_embeddings_all.append(image_features)
                 en_embeddings_all.append(en_embeddings)
                 zh_embeddings_all.append(zh_embeddings)
+                bi_embeddings_all.append(bi_embeddings)
             image_embeddings_all = torch.cat(image_embeddings_all, dim=0)
             en_embeddings_all = torch.cat(en_embeddings_all, dim=0)
             zh_embeddings_all = torch.cat(zh_embeddings_all, dim=0) #1k, 512
             text_embeddings = {'zh': zh_embeddings_all, 'en':en_embeddings_all}
+            if bi_embeddings is not None:
+                bi_embeddings_all = torch.cat(bi_embeddings_all, dim=0)
+                text_embeddings['bi'] = bi_embeddings_all
 
-            for lang in ['zh','en']:
+            for lang in ['zh','en','bi']:
+                if not lang in text_embeddings:
+                    continue
                 sim = image_embeddings_all@text_embeddings[lang].t() #1k img, 1k text
                 for direction in ['Image->Text','Text->Image']:
                     if direction=='Text->Image':
@@ -454,7 +458,8 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
     model.eval()
     batch_time = AverageMeter('Time', ':6.3f')
     top1, top5 = {},{}
-    keys = ['zh','en', 'zh+en_logits', 'zh^en_logits', 'zh+en_probs']#, 'zh+en_feature']
+    keys = ['zh','en', 'zh+en_logits', 'zh^en_logits', 'zh+en_probs',
+        'bi','zh+en+bi_logits','zh+en+bi_probs']#, 'zh+en_feature']
     for k in keys:
         top1[k] = AverageMeter(f'Acc@1_{k}', ':6.2f')
         top5[k] = AverageMeter(f'Acc@5_{k}', ':6.2f')
@@ -466,7 +471,7 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
     print('=> encoding captions')
     cwd = os.path.dirname(os.path.realpath(__file__))
     with torch.no_grad():
-        lang2text_features = {}
+        id2lang_text,lang2text_features = {}, {'zh':[],'en':[]}
         for lang in ['zh','en']:
             lang2text_features[lang] = []
             templates = open(os.path.join(cwd,f'{lang}_templates.txt'),'r').readlines()
@@ -475,18 +480,30 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             for id in sorted(labels):
                 l = labels[id]
                 texts = [t.format(l) for t in templates]
-                texts = tokenizer[lang](texts).cuda(args.gpu, non_blocking=True)
-                if lang=='zh':
-                    class_embeddings = utils.get_model(model).model_zh.encode_text(texts)
-                else:
-                    class_embeddings = utils.get_model(model).model_en.encode_text(texts)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                class_embeddings = class_embeddings.mean(dim=0)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                lang2text_features[lang].append(class_embeddings)
-            lang2text_features[lang] = torch.stack(lang2text_features[lang], dim=0)
-            end = time.time()
-        
+                if not id in id2lang_text:
+                    id2lang_text[id] = {}
+                id2lang_text[id][lang] = tokenizer[lang](texts)
+
+        for id in sorted(labels):
+            zh_embeddings, en_embeddings, bi_embeddings = utils.get_model(model).encode_text(
+                    zh=id2lang_text[id]['zh'].cuda(args.gpu, non_blocking=True), 
+                    en=id2lang_text[id]['en'].cuda(args.gpu, non_blocking=True)) 
+            zh_embeddings, en_embeddings = zh_embeddings.mean(dim=0), en_embeddings.mean(dim=0)
+            en_embeddings = en_embeddings / en_embeddings.norm(dim=-1, keepdim=True)
+            lang2text_features['en'].append(en_embeddings)
+            zh_embeddings = zh_embeddings / zh_embeddings.norm(dim=-1, keepdim=True)
+            lang2text_features['zh'].append(zh_embeddings)
+            if bi_embeddings is not None:
+                if not 'bi' in lang2text_features:
+                    lang2text_features['bi'] = []
+                bi_embeddings = bi_embeddings.mean(dim=0)
+                bi_embeddings = bi_embeddings / bi_embeddings.norm(dim=-1, keepdim=True)
+                lang2text_features['bi'].append(bi_embeddings)
+        for k in lang2text_features:
+            if len(lang2text_features[k])==0:
+                continue
+            lang2text_features[k] = torch.stack(lang2text_features[k], dim=0)
+        end = time.time()
         SAVE = True
         if SAVE:
             fname2logits = {}
@@ -511,6 +528,9 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
                 acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
                 top1[lang].update(acc1.item(), images.size(0))
                 top5[lang].update(acc5.item(), images.size(0))
+            if 'bi' not in lang2text_features:
+                top1['bi'].update(0, images.size(0))
+                top5['bi'].update(0, images.size(0))
 
             #bilingual ensemble
             if SAVE:
@@ -522,6 +542,16 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
             top1['zh+en_logits'].update(acc1.item(), images.size(0))
             top5['zh+en_logits'].update(acc5.item(), images.size(0))    
+
+            if 'bi' in logits_per_image:
+                logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en']+logits_per_image['bi'] #B,V
+                acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
+                acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+                top1['zh+en+bi_logits'].update(acc1.item(), images.size(0))
+                top5['zh+en+bi_logits'].update(acc5.item(), images.size(0))
+            else:
+                top1['zh+en+bi_logits'].update(0, images.size(0))
+                top5['zh+en+bi_logits'].update(0, images.size(0))                        
 
             logits_per_image_bilingual =  torch.stack([logits_per_image['zh'],logits_per_image['en']], dim=-1)  #B,V,2
             logits_per_image_bilingual = torch.max(logits_per_image_bilingual, dim=-1).values  
@@ -536,7 +566,15 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             top1['zh+en_probs'].update(acc1.item(), images.size(0))
             top5['zh+en_probs'].update(acc5.item(), images.size(0)) 
 
-
+            if 'bi' in probs_per_image:
+                probs_per_image_bilingual = probs_per_image['zh']+probs_per_image['en']+probs_per_image['bi'] #B,V
+                acc1, acc5 = accuracy(probs_per_image_bilingual, target, topk=(1, 5))
+                acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+                top1['zh+en+bi_probs'].update(acc1.item(), images.size(0))
+                top5['zh+en+bi_probs'].update(acc5.item(), images.size(0)) 
+            else:
+                top1['zh+en+bi_probs'].update(0, images.size(0))
+                top5['zh+en+bi_probs'].update(0, images.size(0))
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -650,6 +688,8 @@ class AverageMeter(object):
         t = t.tolist()
         self.sum = int(t[0])
         self.count = t[1]
+        if self.count==0:
+            print(self.name, 'count=0!')
         self.avg = self.sum / self.count
 
     def __str__(self):
