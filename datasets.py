@@ -127,27 +127,37 @@ class ImageCaptionDatasetCLIP(ImageCaptionDatasetBase):
         return image, caption
 
 class TripletDataset(torch.utils.data.Dataset):
-    def __init__(self, name, tsv_file, trio_file, preprocess, tokenizer) -> None:
+    def __init__(self, names, catalog, preprocess, tokenizer, need_img=True) -> None:
         super().__init__()
-        self.name = name
-        self.triplets = json.load(open(trio_file, 'r'))
-        print(f'Load {name} from {trio_file} ...')
-        self.tsv = TSVFile(tsv_file)
+        self.names = names.split(',')
+        self.name2triplets, self.name2tsv = {},{}
+        self.index2data = []
+        for name in self.names:
+            self.name2triplets[name] = json.load(open(catalog[name]['metadata'], 'r'))
+            print(f'Load {name}(#={len(self.name2triplets[name])}) from {catalog[name]["metadata"]} ...')
+            if need_img:
+                self.name2tsv[name] = TSVFile(catalog[name]["tsv_root"])
+            self.index2data.extend([(name,i) for i in range(len(self.name2triplets[name]))])
         self.preprocess = preprocess
         self.tokenizer = tokenizer
+        self.need_img = need_img
         
     def __len__(self):
-        return len(self.triplets)
+        return len(self.index2data)
     
     def __getitem__(self, index):
-        img_name, id, en, zh = self.triplets[index]
-        row = self.tsv.seek(id)
-        image = img_from_base64(row[-1])
-        if self.preprocess is not None:
-            image = self.preprocess(image)
+        name, index = self.index2data[index]
+        img_name, id, en, zh = self.name2triplets[name][index]
         en = self.tokenizer['en'](en)
         zh = self.tokenizer['zh'](zh)
-        return {'img':image, 'en':en, 'zh':zh}
+        if self.need_img:
+            row = self.name2tsv[name].seek(id)
+            image = img_from_base64(row[-1])
+            if self.preprocess is not None:
+                image = self.preprocess(image)
+            return {'img':image, 'en':en, 'zh':zh}
+        else:
+            return {'en':en, 'zh':zh}
 
 class TripletDataset_from_rawfile(torch.utils.data.Dataset):
     def __init__(self, img_file, zh, en, preprocess, tokenizer):
@@ -291,5 +301,7 @@ def get_dataset(train_transform, tokenizer, args):
     elif args.model.startswith('SLIP'):
         return ImageCaptionDatasetSLIP(args.dataset, args.root, args.metadata, train_transform, augment, tokenizer)
     elif args.model.startswith('TRIPLET'):
-        return TripletDataset(name=args.dataset, tsv_file=args.root, trio_file=args.metadata, preprocess=train_transform, 
-                              tokenizer=tokenizer) # a dict
+        need_img = (not args.need_only_text)
+        catalog = json.load(open('dataset_catalog.json', 'r'))
+        return TripletDataset(names=args.dataset, catalog=catalog, preprocess=train_transform, 
+                              tokenizer=tokenizer, need_img=need_img) # a dict

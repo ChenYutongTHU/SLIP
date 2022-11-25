@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from utils import load_config
 from triplet import Triplet
+from text_distiller import Text_Distiller
 
 import losses
 
@@ -340,3 +341,8 @@ def TRIPLET(model_cfg_path, **kwargs):
     cfg = load_config(model_cfg_path)
     model = Triplet(cfg, device='cpu')
     return model
+
+def TEXT_DISTILLER(model_cfg_path, **kwargs):
+    cfg = load_config(model_cfg_path)
+    model = Text_Distiller(cfg, device='cpu')
+    return model 

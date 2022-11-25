@@ -37,7 +37,8 @@ from tqdm import tqdm
 def get_args_parser():
     parser = argparse.ArgumentParser(description='SLIP training and evaluation', add_help=False)
     # Data
-    parser.add_argument('--dataset', default='yfcc15m', type=str, choices=['yfcc15m', 'cc3m', 'cc12m', 'coco', 'redcaps'])
+    parser.add_argument('--dataset', default='yfcc15m', type=str)#, choices=['yfcc15m', 'cc3m', 'cc12m', 'coco', 'redcaps'])
+    parser.add_argument('--need_only_text', action='store_true')    
     parser.add_argument('--root', default='', type=str,
                         help='path to dataset root')
     parser.add_argument('--metadata', default='yfcc15m.pkl', type=str,
@@ -220,7 +221,7 @@ def main(args):
         if args.model.startswith('SIMCLR'):
             print('zero-shot evaluation not supported with ssl-only model.')
             return
-        elif args.model.startswith('TRIPLET'):
+        elif args.model in ['TRIPLET'] :
             if args.evaluate_retrieval:
                 zero_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
             else:
@@ -257,7 +258,7 @@ def main(args):
         if args.model.startswith('SIMCLR'):
             val_stats = {'acc1': -1}
             acc1 = -1
-        elif args.model.startswith('TRIPLET'):
+        elif args.model in ['TRIPLET']:
             val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
             acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
                         val_stats['zh+en_logits_acc1'], 
@@ -319,14 +320,14 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         for k, param_group in enumerate(optimizer.param_groups):
             param_group['lr'] = lr_schedule[it]
         
-        if args.model!='TRIPLET':
+        if args.model not in ['TRIPLET']:
             inputs = [tensor.cuda(args.gpu, non_blocking=True) for tensor in inputs]
 
         # compute output
         with amp.autocast(enabled=not args.disable_amp):
             if args.model=='TRIPLET':
                 loss_dict, features_dict, acc_dict = model(
-                    img=inputs['img'],
+                    img=inputs.get('img',None),
                     en=inputs['en'].squeeze(1), zh=inputs['zh'].squeeze(1))
                 loss = loss_dict['total']
                 if len(metrics)==0:

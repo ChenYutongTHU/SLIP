@@ -48,7 +48,6 @@ class Triplet(torch.nn.Module):
         self.tokenize_en = clip.tokenize
         self.model_zh, self.tokenize_zh = wukong.load(pkl_path=cfg['Model_Zh'],device=device,lang='zh',context_length=32)
         
-        self.model_weights_check()
         self.visual = deepcopy(self.model_en.visual)
         del self.visual.proj
         self.visual.proj = None
@@ -67,7 +66,7 @@ class Triplet(torch.nn.Module):
 
         elif cfg['visual_proj'] == 'load_en':
             self.visual_proj = deepcopy(self.model_en.visual.proj)
-        elif cfg['visual_proj'] == 'loca_zh':
+        elif cfg['visual_proj'] == 'load_zh':
             self.visual_proj = deepcopy(self.model_zh.visual.proj)
         if self.model_en.dtype==torch.float16:
             self.visual_proj.data = self.visual_proj.data.half()            
@@ -110,9 +109,10 @@ class Triplet(torch.nn.Module):
             self.tokenize_zh._tokenizer = set_tokenizer_lang(lang='zh', context_length=self.model_en.context_length)
             #language-specific: token_embedding/text_projection
 
-
-
+        self.only_distillation = False
         if 'loss_weight' in cfg:
+            if list(cfg['loss_weight'].keys()) == ['distillation']:
+                self.only_distillation = True
             #adapt to new version
             loss_weight_load  = {}
             for k, v in cfg['loss_weight'].items():
@@ -126,6 +126,12 @@ class Triplet(torch.nn.Module):
                     if 'one_two_loss_mode' in cfg:
                         assert cfg['one_two_loss_mode'] in ['plus_log', 'log_plus', 'single_positive'], cfg['one_two_loss_mode']
                         k = k+'#'+cfg['one_two_loss_mode']
+                elif k=='distillation':
+                    assert cfg['visual_proj'] == 'load_en'
+                    assert cfg['from_scratch'] == False 
+                    assert cfg['trainable_modules'] in [['zh_text_encoder'], ['zh_text_projection']] 
+                    assert cfg['reinitialize_modules'] == ['zh_text_projection']
+                    pass
                 else:
                     pass
                 loss_weight_load[k] = v
@@ -143,19 +149,21 @@ class Triplet(torch.nn.Module):
             freeze_params(self.model_zh) #text encoder (zh)
             freeze_params(self.model_en) #text encoder (en)
             freeze_params(self.visual) #visual encoder
-            if 'text_encoder' in cfg['trainable_modules']:
+            if 'zh_text_encoder' in cfg['trainable_modules']:
                 unfreeze_params(self.model_zh.transformer)
                 unfreeze_params(self.model_zh.token_embedding)
                 self.model_zh.positional_embedding.requires_grad = True
                 unfreeze_params(self.model_zh.ln_final)
+                self.model_zh.text_projection.requires_grad = True
+            if 'zh_text_projection' in cfg['trainable_modules']:
+                self.model_zh.text_projection.requires_grad = True
+            if 'en_text_projection' in cfg['trainable_modules']:
+                self.model_en.text_projection.requires_grad = True
+            if 'en_text_encoder' in cfg['trainable_modules']:
                 unfreeze_params(self.model_en.transformer)
                 self.model_en.positional_embedding.requires_grad = True
                 unfreeze_params(self.model_en.token_embedding)
                 unfreeze_params(self.model_en.ln_final)
-                self.model_zh.text_projection.requires_grad = True
-                self.model_en.text_projection.requires_grad = True
-            if 'text_projection' in cfg['trainable_modules']:
-                self.model_zh.text_projection.requires_grad = True
                 self.model_en.text_projection.requires_grad = True
             if 'visual_proj' not in cfg['trainable_modules']:
                 self.visual_proj.requires_grad = False
@@ -165,7 +173,10 @@ class Triplet(torch.nn.Module):
             for n, p in self.named_parameters():
                 if p.requires_grad==True:
                     print(n)
-        
+        if cfg.get('reinitialize_modules', [])!=[]:
+            if 'zh_text_projection' in cfg['reinitialize_modules']:
+                nn.init.normal_(self.model_zh.text_projection, std=self.model_zh.transformer.width ** -0.5) 
+
         if 'x_attn_encoder' in cfg:
             self.self_attn_layers = self.model_zh.transformer.layers-cfg['x_attn_encoder']['layers']
             self.x_attn_encoder = X_Attn_Encoder(
@@ -178,6 +189,8 @@ class Triplet(torch.nn.Module):
         else:
             self.self_attn_layers = -1
             self.x_attn_encoder = None
+
+    #     self.model_weights_check()
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -229,7 +242,18 @@ class Triplet(torch.nn.Module):
             bi_text_features = None
         return zh_text_features, en_text_features, bi_text_features
 
-    def forward(self, img, en, zh):
+    def forward_only_distillation(self, en, zh):
+        with torch.no_grad():
+            en_text_features, _, _ = self.model_en.encode_text(en) #B,D
+        zh_text_features, _, _ = self.model_zh.encode_text(zh) #B,D
+        loss_dict = {}
+        loss_dict['distillation'] = torch.nn.functional.mse_loss(zh_text_features, en_text_features, reduction='mean') 
+        loss_dict['total'] = loss_dict['distillation']
+        return loss_dict
+    
+    def forward(self, en, zh, img=None):
+        if self.only_distillation and img==None:
+            return self.forward_only_distillation(en=en, zh=zh), {}, {}
         image_features = self.encode_image(img)
         image_features = self.normalize(image_features)
 
@@ -254,7 +278,10 @@ class Triplet(torch.nn.Module):
             gathered_features_dict = features_dict
         
         for loss_key, loss_weight in self.loss_weight.items():
-            if '|' in loss_key:
+            if loss_key=='distillation':
+                loss_dict[loss_key] = torch.nn.functional.mse_loss(zh_text_features, en_text_features, reduction='mean')                 
+                loss_dict['total'] += loss_weight*loss_dict[loss_key]
+            elif '|' in loss_key:
                 #one-two loss
                 assert 'bi_text' in features_dict, 'do not support one-two loss for x_attn'
                 k0k1k2, one_two_loss_mode = loss_key.split('#')
