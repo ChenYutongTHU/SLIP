@@ -142,9 +142,35 @@
         "test": "test"
     },
     "imagenet": {
-        "path": "/path/to/dataset",
+        "path": "/data11/private/chenyutong/ILSVRC/Data/CLS-LOC",
         "type": "imagefolder",
         "train": "train",
         "test": "val"
+    },
+    "cc3m": {
+        "tsv_root": "/data11/private/chenyutong/data/cc3m/cc3m_train.tsv",
+        "metadata": "../CLIP_distillation/data/ALBEF/triplets/cc3m_train_trio.json"
+    },
+    "cc12m": {
+        "tsv_root": "/data11/private/chenyutong/data/cc12m/cc12m_train.tsv",
+        "metadata": "../CLIP_distillation/data/ALBEF/triplets/cc12m_train_trio_10055143.json"
+    },
+    "coco_sbu_vg": {
+        "metadata": "../CLIP_distillation/data/ALBEF/triplets/coco_sbu_vg_train_trio.json"
+    },
+    "aic": {
+        "metadata": "../CLIP_distillation/data/ALBEF/triplets/aic_train_trio.json"
+    },
+    "tsl2019":{
+        "metadata": "/data11/private/chenyutong/data/translation2019zh_train_val_trio.json"
+    },
+    "newsv16":{
+        "metadata": "/data11/private/chenyutong/data/wmt/news-commentary-v16.en-zh.json"
+    },
+    "wikititles":{
+        "metadata": "/data11/private/chenyutong/data/wmt/wikititles-v3.zh-en.json"
+    },
+    "wikimatrix":{
+        "metadata": "/data11/private/chenyutong/data/wmt/WikiMatrix.v1.en-zh.json"
     }
 }

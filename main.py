@@ -214,7 +214,7 @@ def main(args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=(val_sampler is None),
+        val_dataset, batch_size=128, shuffle=(val_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=val_sampler, drop_last=False)
 
     if args.evaluate:
@@ -244,7 +244,10 @@ def main(args):
         wandb.run.save()
 
     print(args)
-
+    if args.model in ['TRIPLET']:
+        print("=> Evaluation before training")
+        val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+        print(val_stats)
     print("=> beginning training")
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -412,7 +415,7 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
             val_dataset = datasets.TripletDataset_from_rawfile(
                 img_file=img_files, zh=zh_caps, en=en_caps, preprocess=val_transform, tokenizer=tokenizer)
             val_dataloader = torch.utils.data.DataLoader(
-                val_dataset, batch_size=args.batch_size, shuffle=False,
+                val_dataset, batch_size=128, shuffle=False,
                     num_workers=args.workers, pin_memory=True, drop_last=False)
 
             print('Compute embeddings ... ')

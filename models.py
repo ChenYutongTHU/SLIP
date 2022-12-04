@@ -13,7 +13,6 @@ import torch
 from torch import nn
 from utils import load_config
 from triplet import Triplet
-from text_distiller import Text_Distiller
 
 import losses
 
