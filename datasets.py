@@ -17,8 +17,8 @@ from torchvision import transforms
 from torchvision import datasets as t_datasets
 from read_tsv import TSVFile, img_from_base64
 import utils
-
-
+from model_center.dataset import DistributedMMapIndexedDataset, MMapIndexedDataset
+import bmtrain as bmt
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
@@ -126,6 +126,32 @@ class ImageCaptionDatasetCLIP(ImageCaptionDatasetBase):
 
         return image, caption
 
+
+class TextDistillDataset(torch.utils.data.Dataset):
+    def __init__(self, names, catalog):#zh : MMapIndexedDataset, en : MMapIndexedDataset):
+        super().__init__()
+        self.names = names.split(',')
+        self.name2IndexedDataset = {}
+        self.index2data = []
+        for name in self.names:
+            self.name2IndexedDataset[name] = {
+                'zh': MMapIndexedDataset(catalog[name]['indexed_dataset']['zh']),
+                'en': MMapIndexedDataset(catalog[name]['indexed_dataset']['en']),
+            }
+            print(name, f'#={len(self.name2IndexedDataset[name]["zh"])}')
+            self.index2data.extend([(name,i) for i in range(len(self.name2IndexedDataset[name]['zh']))])
+        #assert len(self.zh)==len(self.en), (len(self.zh), len(self.en))
+        print(f'Total number={len(self.index2data)}')
+
+    def __len__(self):
+        return len(self.index2data)
+    
+    def __getitem__(self, ith):
+        name, ith = self.index2data[ith]
+        zh_input_ids = self.name2IndexedDataset[name]['zh'][ith] # get the i-th data from DistributedMMapIndexedDataset]
+        en_input_ids = self.name2IndexedDataset[name]['en'][ith]
+        return {'zh': zh_input_ids, 'en': en_input_ids}
+
 class TripletDataset(torch.utils.data.Dataset):
     def __init__(self, names, catalog, preprocess, tokenizer, need_img=True) -> None:
         super().__init__()
@@ -158,6 +184,18 @@ class TripletDataset(torch.utils.data.Dataset):
             return {'img':image, 'en':en, 'zh':zh}
         else:
             return {'en':en, 'zh':zh}
+
+class BilingualDataset_from_list(torch.utils.data.Dataset):
+    def __init__(self, zh, en, tokenizer):
+        super().__init__()
+        self.zh, self.en = zh, en
+        self.tokenizer = tokenizer
+    def __len__(self):
+        return len(self.zh)
+    def __getitem__(self, index):
+        en = self.tokenizer['en'](self.en[index])
+        zh = self.tokenizer['zh'](self.zh[index])        
+        return {'en':en, 'zh':zh}
 
 class TripletDataset_from_rawfile(torch.utils.data.Dataset):
     def __init__(self, img_file, zh, en, preprocess, tokenizer):
@@ -303,5 +341,10 @@ def get_dataset(train_transform, tokenizer, args):
     elif args.model.startswith('TRIPLET'):
         need_img = (not args.need_only_text)
         catalog = json.load(open('dataset_catalog.json', 'r'))
-        return TripletDataset(names=args.dataset, catalog=catalog, preprocess=train_transform, 
+        if args.toolkit_data=='torch':
+            return TripletDataset(names=args.dataset, catalog=catalog, preprocess=train_transform, 
                               tokenizer=tokenizer, need_img=need_img) # a dict
+        elif args.toolkit_data=='bm' and need_img==False:
+            return TextDistillDataset(names=args.dataset, catalog=catalog)
+        else:
+            raise ValueError

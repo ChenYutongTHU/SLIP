@@ -13,7 +13,8 @@ import torch
 from torch import nn
 from utils import load_config
 from triplet import Triplet
-
+from triplet_bm import Triplet_bm
+import bmtrain as bmt
 import losses
 
 
@@ -336,12 +337,12 @@ def SLIP_VITL16(**kwargs):
 
     return model
 
-def TRIPLET(model_cfg_path, **kwargs):
+def TRIPLET(model_cfg_path, toolkit, **kwargs):
     cfg = load_config(model_cfg_path)
-    model = Triplet(cfg, device='cpu')
+    if toolkit=='torch':
+        model = Triplet(cfg, device='cpu')
+    elif toolkit=='bm':
+        model = Triplet(cfg, device='cpu')
+        model = bmt.BMTrainModelWrapper(model)
     return model
 
-def TEXT_DISTILLER(model_cfg_path, **kwargs):
-    cfg = load_config(model_cfg_path)
-    model = Text_Distiller(cfg, device='cpu')
-    return model 

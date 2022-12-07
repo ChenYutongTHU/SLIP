@@ -17,7 +17,8 @@ import time
 from collections import defaultdict, deque
 import datetime
 import subprocess
-
+import bmtrain as bmt
+TOOLKIT = 'torch'
 def get_sha():
     cwd = os.path.dirname(os.path.abspath(__file__))
 
@@ -246,17 +247,34 @@ def is_dist_avail_and_initialized():
 
 
 def get_world_size():
-    if not is_dist_avail_and_initialized():
-        return 1
-    return dist.get_world_size()
+    if TOOLKIT=='torch':
+        if not is_dist_avail_and_initialized():
+            return 1
+        return dist.get_world_size()
+    elif TOOLKIT=='bm':
+        return bmt.world_size()
 
 
 def get_rank():
-    if not is_dist_avail_and_initialized():
-        return 0
-    return dist.get_rank()
+    if TOOLKIT=='torch':
+        if not is_dist_avail_and_initialized():
+            return 0
+        return dist.get_rank()
+    elif TOOLKIT=='bm':
+        return bmt.rank()
 
+def dist_synchronize():
+    if TOOLKIT=='torch':
+        dist.barrier()
+    elif TOOLKIT=='bm':
+        bmt.synchronize()
 
+def dist_all_reduce(t):
+    if TOOLKIT=='torch':
+        dist.all_reduce(t)
+    elif TOOLKIT=='bm':
+        bmt.distributed.all_reduce(t)
+        
 def is_main_process():
     return get_rank() == 0
 
@@ -271,6 +289,7 @@ def save_on_master(state, is_best, output_dir):
 
 
 def init_distributed_mode(args):
+    print(f"Use {args.toolkit} as distributed training")
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
@@ -284,14 +303,25 @@ def init_distributed_mode(args):
         return
 
     args.distributed = True
-
+    #print(f'rank {args.rank}, world_size {args.world_size}, gpu{args.gpu}')
     torch.cuda.set_device(args.gpu)
-    args.dist_backend = 'nccl'
-    print('| distributed init (rank {}): {}'.format(
-        args.rank, args.dist_url), flush=True)
-    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                         world_size=args.world_size, rank=args.rank)
-    torch.distributed.barrier()
+    if args.toolkit=='torch':
+        args.dist_backend = 'nccl'
+        print('| distributed init (rank {}): {}'.format(
+            args.rank, args.dist_url), flush=True)
+        torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                            world_size=args.world_size, rank=args.rank)
+        torch.distributed.barrier()
+    elif args.toolkit=='bm':
+        global TOOLKIT
+        TOOLKIT = 'bm'
+        print('| distributed init (rank {}): world_size={}'.format(get_rank(), get_world_size()))
+        bmt.init_distributed(
+            seed=args.seed+args.rank, zero_level=3,
+        ) #it reads enviroment variables
+    else:
+        raise ValueError
+
     setup_for_distributed(args.rank == 0)
 
 
@@ -308,11 +338,11 @@ def scaled_all_reduce(tensors, is_scale=True):
     # Queue the reductions
     reductions = []
     for tensor in tensors:
-        reduction = dist.all_reduce(tensor, async_op=True)
+        reduction = dist_all_reduce(tensor)#dist.all_reduce(tensor, async_op=True)
         reductions.append(reduction)
     # Wait for reductions to finish
-    for reduction in reductions:
-        reduction.wait()
+    # for reduction in reductions:
+    #     reduction.wait()
     # Scale the results
     if is_scale:
         for tensor in tensors:

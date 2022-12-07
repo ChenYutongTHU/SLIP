@@ -29,13 +29,16 @@ import datasets
 import models
 from tokenizer import SimpleTokenizer
 import utils
-from utils import get_rank, get_world_size, is_main_process
+from utils import get_rank, get_world_size, is_main_process, dist_synchronize, dist_all_reduce
 from PIL import Image
 from tqdm import tqdm
-
+from model_center.dataset import DistributedDataLoader
 
 def get_args_parser():
     parser = argparse.ArgumentParser(description='SLIP training and evaluation', add_help=False)
+    parser.add_argument('--eval_freq', type=int, default=1)
+    parser.add_argument('--toolkit', default='torch', help='torch or bm')
+    parser.add_argument('--toolkit_data', default='torch')
     # Data
     parser.add_argument('--dataset', default='yfcc15m', type=str)#, choices=['yfcc15m', 'cc3m', 'cc12m', 'coco', 'redcaps'])
     parser.add_argument('--need_only_text', action='store_true')    
@@ -81,6 +84,7 @@ def get_args_parser():
                         help='number of data loading workers per process')
     parser.add_argument('--evaluate', action='store_true', help='eval only')
     parser.add_argument('--evaluate_retrieval', action='store_true', help='eval only')
+    parser.add_argument('--evaluate_text_retrieval', action='store_true', help='eval only')
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of nodes for distributed training')
     parser.add_argument('--rank', default=0, type=int,
@@ -100,7 +104,6 @@ best_acc1 = 0
 def main(args):
     utils.init_distributed_mode(args)
     global best_acc1
-
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
@@ -110,10 +113,11 @@ def main(args):
     print("=> creating model: {}".format(args.model))
     model = getattr(models, args.model)(
         ssl_mlp_dim=args.ssl_mlp_dim, ssl_emb_dim=args.ssl_emb_dim,
-        model_cfg_path=args.model_cfg_path)
+        model_cfg_path=args.model_cfg_path, toolkit=args.toolkit)
     model.cuda(args.gpu)
-
-    if args.distributed:
+    if args.toolkit=='bm':
+        assert args.toolkit_data=='bm'
+    if args.distributed and args.toolkit=='torch':
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], bucket_cap_mb=200)
 
     # define loss function (criterion) and optimizer
@@ -202,20 +206,26 @@ def main(args):
 
     # dist eval resamples data to pad uneven batch sizes
     # make sure num_samples = 0 mod num_gpus for exact acc
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
-    else:
-        train_sampler = None
-        val_sampler = None
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+    if args.toolkit in 'torch': #toolkit! instead of toolkit_data (dist.get_rank())
+        if args.distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+            val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
+        else:
+            train_sampler = None
+            val_sampler = None
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+            num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=128, shuffle=(val_sampler is None),
+            num_workers=args.workers, pin_memory=True, sampler=val_sampler, drop_last=False)
+    elif args.toolkit=='bm': #(bm.get_rank())
+        train_loader = DistributedDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+        val_loader = DistributedDataLoader(val_dataset, batch_size=128, shuffle=False, 
+            drop_last=False,num_workers=args.workers,pin_memory=True)
 
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=128, shuffle=(val_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=val_sampler, drop_last=False)
+
 
     if args.evaluate:
         if args.model.startswith('SIMCLR'):
@@ -224,6 +234,8 @@ def main(args):
         elif args.model in ['TRIPLET'] :
             if args.evaluate_retrieval:
                 zero_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+            elif args.evaluate_text_retrieval:
+                zero_stats = validate_retrieval_bilingual_text(model, tokenizer, args)
             else:
                 zero_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
         else:
@@ -244,13 +256,13 @@ def main(args):
         wandb.run.save()
 
     print(args)
-    if args.model in ['TRIPLET']:
-        print("=> Evaluation before training")
-        val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-        print(val_stats)
+    # if args.model in ['TRIPLET']:
+    #     print("=> Evaluation before training")
+    #     val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+    #     print(val_stats)
     print("=> beginning training")
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
+        if args.distributed and args.toolkit=='torch':
             train_sampler.set_epoch(epoch)
         # train for one epoch
         train_stats = train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args)
@@ -329,6 +341,8 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         # compute output
         with amp.autocast(enabled=not args.disable_amp):
             if args.model=='TRIPLET':
+                if args.toolkit=='bm':
+                    inputs = {k:tensor.cuda(args.gpu, non_blocking=True) for k,tensor in inputs.items()}
                 loss_dict, features_dict, acc_dict = model(
                     img=inputs.get('img',None),
                     en=inputs['en'].squeeze(1), zh=inputs['zh'].squeeze(1))
@@ -389,6 +403,63 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
     return {**{k: v.avg for k, v in metrics.items()},
             'lr': optimizer.param_groups[0]['lr'],
             'logit_scale': logit_scale}
+
+def validate_retrieval_bilingual_text(model, tokenizer, args):
+    model.eval()
+    DATASET2FILE = {
+        'coco-cn': 'data/coco_cn/coco_cn_test.json', #{'img_id':{'zh':,'en':}}
+        'un':'data/text_retrieval/un10k.json'
+    }    
+    if utils.is_main_process(): #one gpu is enough
+        for dataset in ['un', 'coco-cn']:
+            print(f'Evaluate En<->Zh Retrieval on {dataset} ...')
+            with open(DATASET2FILE[dataset],'r') as f:
+                id2texts = json.load(f)
+            zh_texts, en_texts = [], []
+            for _, c in id2texts.items():
+                zh_texts.append(c['zh'])
+                en_texts.append(c['en'])    
+            val_dataset = datasets.BilingualDataset_from_list(
+                zh=zh_texts, en=en_texts, tokenizer=tokenizer)
+            val_dataloader = torch.utils.data.DataLoader(
+                val_dataset, batch_size=128, shuffle=False, num_workers=args.workers, pin_memory=True, drop_last=False)          
+            zh_embeddings_all, en_embeddings_all = [],[]
+            for batch in tqdm(val_dataloader):
+                with torch.no_grad():
+                    zh_embeddings, en_embeddings, bi_embeddings = \
+                        utils.get_model(model).encode_text(
+                            zh=batch['zh'].squeeze(1).cuda(), 
+                            en=batch['en'].squeeze(1).cuda())
+                zh_embeddings_all.append(zh_embeddings)
+                en_embeddings_all.append(en_embeddings)
+            en_embeddings_all = torch.cat(en_embeddings_all, dim=0)
+            zh_embeddings_all = torch.cat(zh_embeddings_all, dim=0) #1k, 512
+            
+            #retrieval
+            sim_en_zh = en_embeddings_all@zh_embeddings_all.t() #1k en, 1k zh
+            for direction in ['En->Zh','Zh->En']:
+                if direction=='Zh->En':
+                    sim_ = sim_en_zh.t() #text image
+                else:
+                    sim_ = sim_en_zh
+                pred_topk = torch.topk(sim_, k=5, dim=-1).indices #1k, 5 label: 0,1,2,3,4
+                label = torch.arange(en_embeddings_all.shape[0])[:,None].cuda() #1k,1
+                acc1 = torch.mean((pred_topk[:,0:1]==label).float())
+                acc5 = torch.mean(torch.max((pred_topk==label).float(),dim=-1).values)
+                acc1, acc5 = (acc1*100).item(), (acc5*100).item()
+                print('{} acc1={:.2f} acc5={:.2f}'.format(direction,  acc1, acc5))  
+                
+                src_texts = zh_texts if direction=='Zh->En' else en_texts
+                tgt_texts = en_texts if direction=='Zh->En' else zh_texts 
+                with open(os.path.join(args.output_dir, f'retrieve_{dataset}_{direction}.txt'),'w') as f:
+                    for si in range(50):
+                        f.writelines(src_texts[si][0]+'\n')   
+                        f.writelines('Correct Answer: '+tgt_texts[si][0]+'\n')
+                        f.writelines('Retrieve Results:\n') 
+                        for ti in pred_topk[si]:
+                            f.writelines(tgt_texts[ti.item()][0]+'\n')
+                        f.writelines('\n')    
+                print('Write some samples in '+os.path.join(args.output_dir, f'retrieve_{dataset}_{direction}.txt'))
 
 def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
     model.eval()
@@ -455,7 +526,8 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
                     acc5 = torch.mean(torch.max((pred_topk==label).float(),dim=-1).values)
                     acc1, acc5 = (acc1*100).item(), (acc5*100).item()
                     print('{}({}) acc1={:.2f} acc5={:.2f}'.format(direction, lang, acc1, acc5))
-    dist.barrier()
+    #dist.barrier()
+    dist_synchronize()
     model.train()
 
 def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
@@ -472,7 +544,6 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
         [batch_time]+[top1[k] for k in keys] + [top5[k] for k in keys],
         prefix='Test: ')
 
-    print('=> encoding captions')
     cwd = os.path.dirname(os.path.realpath(__file__))
     with torch.no_grad():
         id2lang_text,lang2text_features = {}, {'zh':[],'en':[]}
@@ -487,16 +558,18 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
                 if not id in id2lang_text:
                     id2lang_text[id] = {}
                 id2lang_text[id][lang] = tokenizer[lang](texts)
-
+        print('=> encoding captions')
         for id in sorted(labels):
             zh_embeddings, en_embeddings, bi_embeddings = utils.get_model(model).encode_text(
                     zh=id2lang_text[id]['zh'].cuda(args.gpu, non_blocking=True), 
                     en=id2lang_text[id]['en'].cuda(args.gpu, non_blocking=True)) 
+            #print('beform norm', torch.nn.functional.mse_loss(zh_embeddings, en_embeddings, reduction='mean'))
             zh_embeddings, en_embeddings = zh_embeddings.mean(dim=0), en_embeddings.mean(dim=0)
             en_embeddings = en_embeddings / en_embeddings.norm(dim=-1, keepdim=True)
             lang2text_features['en'].append(en_embeddings)
             zh_embeddings = zh_embeddings / zh_embeddings.norm(dim=-1, keepdim=True)
             lang2text_features['zh'].append(zh_embeddings)
+            #print('after norm', torch.nn.functional.mse_loss(zh_embeddings, en_embeddings, reduction='mean'))
             if bi_embeddings is not None:
                 if not 'bi' in lang2text_features:
                     lang2text_features['bi'] = []
@@ -513,7 +586,7 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             fname2logits = {}
         logit_scale = utils.get_model(model).logit_scale.exp()
         logit_scale.data = torch.clamp(logit_scale.data, max=100)
-
+        print('=> encoding images and compute similarities')
         for i, (images, target, fnames) in enumerate(val_loader):
             images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
@@ -687,8 +760,11 @@ class AverageMeter(object):
         if not utils.is_dist_avail_and_initialized():
             return
         t = torch.tensor([self.sum, self.count], dtype=torch.float64, device='cuda')
-        dist.barrier()
-        dist.all_reduce(t)
+        #dist.barrier()
+        dist_synchronize()
+        #dist.all_reduce(t)
+        dist_all_reduce(t)
+        
         t = t.tolist()
         self.sum = int(t[0])
         self.count = t[1]

@@ -4,153 +4,60 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from .model_bm import CLIP_bm
+import bmtrain as bmt
+from typing import Optional
 
-
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1):
+class Linear(bmt.DistributedModule):
+    def __init__(self, in_features : int, out_features: int, bias: bool = True, dtype = None) -> None:
         super().__init__()
 
-        # all conv layers have stride 1. an avgpool is performed after the second convolution when stride > 1
-        self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = bmt.DistributedParameter(torch.empty(out_features, in_features, dtype=dtype, device="cuda"), init_method=torch.nn.init.xavier_normal_)
+        if bias:
+            self.bias = bmt.DistributedParameter(torch.empty(out_features, dtype=dtype, device="cuda"), init_method=torch.nn.init.zeros_)
+        else:
+            self.register_parameter('bias', None)
+    
+    def forward(self, input):
+        return F.linear(input, self.weight, self.bias)
 
-        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-
-        self.avgpool = nn.AvgPool2d(stride) if stride > 1 else nn.Identity()
-
-        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
-
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = None
-        self.stride = stride
-
-        if stride > 1 or inplanes != planes * Bottleneck.expansion:
-            # downsampling layer is prepended with an avgpool, and the subsequent convolution has stride 1
-            self.downsample = nn.Sequential(OrderedDict([
-                ("-1", nn.AvgPool2d(stride)),
-                ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False)),
-                ("1", nn.BatchNorm2d(planes * self.expansion))
-            ]))
-
-    def forward(self, x: torch.Tensor):
-        identity = x
-
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
-        out = self.avgpool(out)
-        out = self.bn3(self.conv3(out))
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-        return out
-
-
-class AttentionPool2d(nn.Module):
-    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
-        super().__init__()
-        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.v_proj = nn.Linear(embed_dim, embed_dim)
-        self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
-        self.num_heads = num_heads
-
-    def forward(self, x):
-        x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
-        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
-        x, _ = F.multi_head_attention_forward(
-            query=x, key=x, value=x,
-            embed_dim_to_check=x.shape[-1],
-            num_heads=self.num_heads,
-            q_proj_weight=self.q_proj.weight,
-            k_proj_weight=self.k_proj.weight,
-            v_proj_weight=self.v_proj.weight,
-            in_proj_weight=None,
-            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
-            bias_k=None,
-            bias_v=None,
-            add_zero_attn=False,
-            dropout_p=0,
-            out_proj_weight=self.c_proj.weight,
-            out_proj_bias=self.c_proj.bias,
-            use_separate_proj_weight=True,
-            training=self.training,
-            need_weights=False
+    def extra_repr(self) -> str:
+        return 'in_features={}, out_features={}, bias={}'.format(
+            self.in_features, self.out_features, self.bias is not None
         )
 
-        return x[0]
+class Layernorm_bm(bmt.DistributedModule):
+    __constants__ = ['normalized_shape', 'eps', 'elementwise_affine']
+    normalized_shape: Tuple[int, ...]
+    eps: float
+    elementwise_affine: bool
 
-
-class ModifiedResNet(nn.Module):
-    """
-    A ResNet class that is similar to torchvision's but contains the following changes:
-    - There are now 3 "stem" convolutions as opposed to 1, with an average pool instead of a max pool.
-    - Performs anti-aliasing strided convolutions, where an avgpool is prepended to convolutions with stride > 1
-    - The final pooling layer is a QKV attention instead of an average pool
-    """
-
-    def __init__(self, layers, output_dim, heads, input_resolution=224, width=64):
+    def __init__(self, normalized_shape, eps: float = 1e-5, elementwise_affine: bool = True,
+                dtype=None) -> None:
         super().__init__()
-        self.output_dim = output_dim
-        self.input_resolution = input_resolution
+        if isinstance(normalized_shape, int):
+            # mypy error: incompatible types in assignment
+            normalized_shape = (normalized_shape,)  # type: ignore[assignment]
+        self.normalized_shape = tuple(normalized_shape)  # type: ignore[arg-type]
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = bmt.DistributedParameter(torch.empty(self.normalized_shape, dtype=dtype, device="cuda"), init_method=torch.nn.init.ones_)
+            self.bias = bmt.DistributedParameter(torch.empty(self.normalized_shape, dtype=dtype, device="cuda"), init_method=torch.nn.init.zeros_)
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
 
-        # the 3-layer stem
-        self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(width // 2)
-        self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(width // 2)
-        self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(width)
-        self.avgpool = nn.AvgPool2d(2)
-        self.relu = nn.ReLU(inplace=True)
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(
+            input, self.normalized_shape, self.weight, self.bias, self.eps)
 
-        # residual layers
-        self._inplanes = width  # this is a *mutable* variable used during construction
-        self.layer1 = self._make_layer(width, layers[0])
-        self.layer2 = self._make_layer(width * 2, layers[1], stride=2)
-        self.layer3 = self._make_layer(width * 4, layers[2], stride=2)
-        self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
+    def extra_repr(self) -> str:
+        return '{normalized_shape}, eps={eps}, ' \
+            'elementwise_affine={elementwise_affine}'.format(**self.__dict__)
 
-        embed_dim = width * 32  # the ResNet feature dimension
-        self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim)
-
-    def _make_layer(self, planes, blocks, stride=1):
-        layers = [Bottleneck(self._inplanes, planes, stride)]
-
-        self._inplanes = planes * Bottleneck.expansion
-        for _ in range(1, blocks):
-            layers.append(Bottleneck(self._inplanes, planes))
-
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        def stem(x):
-            for conv, bn in [(self.conv1, self.bn1), (self.conv2, self.bn2), (self.conv3, self.bn3)]:
-                x = self.relu(bn(conv(x)))
-            x = self.avgpool(x)
-            return x
-
-        x = x.type(self.conv1.weight.dtype)
-        x = stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.attnpool(x)
-
-        return x
-
-
-class LayerNorm(nn.LayerNorm):
+class LayerNorm(Layernorm_bm):
     """Subclass torch's LayerNorm to handle fp16."""
 
     def forward(self, x: torch.Tensor):
@@ -159,22 +66,100 @@ class LayerNorm(nn.LayerNorm):
         return ret.type(orig_type)
 
 
-class QuickGELU(nn.Module):
+class QuickGELU(bmt.DistributedModule):
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
 
+class Attention_bm(bmt.DistributedModule):
+    def __init__(self, 
+            dim_model : int, dim_head : int,
+            num_heads : int, add_bias_kv :bool = False, bias : bool = True,
+            dtype = None
+        ) -> None:
+        super().__init__()
 
-class ResidualAttentionBlock(nn.Module):
+        self.project_q = Linear(dim_model, dim_head * num_heads, bias=bias, dtype=dtype)
+        self.project_k = Linear(dim_model, dim_head * num_heads, bias=add_bias_kv, dtype=dtype)
+        self.project_v = Linear(dim_model, dim_head * num_heads, bias=add_bias_kv, dtype=dtype)
+
+        self.project_out = Linear(dim_head * num_heads, dim_model, bias=bias, dtype=dtype)
+
+        self.softmax = torch.nn.Softmax(dim=-1)
+        self.num_heads = num_heads
+        self.dim_head = dim_head
+        self.dim_model = dim_model
+    
+    def forward(self, 
+            hidden_q : torch.Tensor,        # (batch_size, seq_q, dim_model)
+            hidden_kv : torch.Tensor,       # (batch_size, seq_kv, dim_model)
+            mask : torch.BoolTensor,        # (batch_size, seq_q, seq_kv)
+            position_bias : Optional[torch.Tensor] = None,   # (batch, num_heads, seq_q, seq_kv)
+        ) -> torch.Tensor:
+        batch_size, seq_q, dim_model = hidden_q.size()
+        seq_kv = hidden_kv.size(1)
+
+        h_q : torch.Tensor = self.project_q(hidden_q)
+        h_k : torch.Tensor = self.project_k(hidden_kv)
+        h_v : torch.Tensor = self.project_v(hidden_kv)
+
+        h_q = h_q.view(batch_size, seq_q, self.num_heads, self.dim_head)
+        h_k = h_k.view(batch_size, seq_kv, self.num_heads, self.dim_head)
+        h_v = h_v.view(batch_size, seq_kv, self.num_heads, self.dim_head)
+
+        h_q = h_q.permute(0, 2, 1, 3).contiguous()
+        h_k = h_k.permute(0, 2, 1, 3).contiguous()
+        h_v = h_v.permute(0, 2, 1, 3).contiguous()
+
+        h_q = h_q.view(batch_size * self.num_heads, seq_q, self.dim_head)
+        h_k = h_k.view(batch_size * self.num_heads, seq_kv, self.dim_head)
+        h_v = h_v.view(batch_size * self.num_heads, seq_kv, self.dim_head)
+
+        score = torch.bmm(
+            h_q, h_k.transpose(1, 2)
+        )
+        score = score / math.sqrt(self.dim_head)
+
+        score = score.view(batch_size, self.num_heads, seq_q, seq_kv)
+
+        if position_bias is not None:
+            score = score + position_bias.view(batch_size, self.num_heads, seq_q, seq_kv)
+        
+        score = torch.where(
+            mask.view(batch_size, 1, seq_q, seq_kv),
+            score,
+            torch.scalar_tensor(float('-inf'), device=score.device, dtype=score.dtype)
+        )
+
+        score = torch.where(
+            mask.view(batch_size, 1, seq_q, seq_kv),
+            self.softmax(score),
+            torch.scalar_tensor(0, device=score.device, dtype=score.dtype)
+        )
+
+        score = score.view(batch_size * self.num_heads, seq_q, seq_kv)
+
+        h_out = torch.bmm(
+            score, h_v
+        )
+        h_out = h_out.view(batch_size, self.num_heads, seq_q, self.dim_head)
+        h_out = h_out.permute(0, 2, 1, 3).contiguous()
+        h_out = h_out.view(batch_size, seq_q, self.num_heads * self.dim_head)
+
+        attn_out = self.project_out(h_out)
+        return attn_out
+
+class ResidualAttentionBlock(bmt.DistributedModule):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        #self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.attn = Attention_bm(dim_model=d_model, dim_head=d_model//n_head, num_heads=n_head)
         self.n_head = n_head
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("c_fc", Linear(d_model, d_model * 4)),
             ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(d_model * 4, d_model))
+            ("c_proj", Linear(d_model * 4, d_model))
         ]))
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
@@ -206,13 +191,14 @@ class ResidualAttentionBlock(nn.Module):
         return x, attn_weights
 
 
-class Transformer(nn.Module):
+class Transformer(bmt.DistributedModule):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
         self.width = width
         self.layers = layers
         self.heads = heads
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.resblocks = bmt.TransformerBlockList(
+            [bmt.CheckpointBlock(ResidualAttentionBlock(width, heads, attn_mask)) for _ in range(layers)])
 
     def forward(self, x: torch.Tensor, attn_mask=None):
         #return self.resblocks(x)
@@ -224,7 +210,7 @@ class Transformer(nn.Module):
             xs.append(x)
         return xs, layers_attn_weights
 
-class VisionTransformer(nn.Module):
+class VisionTransformer(bmt.DistributedModule):
     def __init__(self, 
         input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int,
         return_full_embed=False):
@@ -234,14 +220,14 @@ class VisionTransformer(nn.Module):
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.class_embedding = bmt.DistributedParameter(scale * torch.randn(width))
+        self.positional_embedding = bmt.DistributedParameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
 
         self.transformer = Transformer(width, layers, heads)
 
         self.ln_post = LayerNorm(width)
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.proj = bmt.DistributedParameter(scale * torch.randn(width, output_dim))
         self.return_full_embed = return_full_embed
 
     def forward(self, x: torch.Tensor):
@@ -263,7 +249,7 @@ class VisionTransformer(nn.Module):
 
         return x
 
-class X_Attn_Encoder(nn.Module):
+class X_Attn_Encoder(bmt.DistributedModule):
     def __init__(self,
         layers, width, heads, embed_dim,
         context_length, causal_attn, order):
@@ -273,7 +259,7 @@ class X_Attn_Encoder(nn.Module):
                 width=width, layers=layers, heads=heads,
                 attn_mask=self.build_attention_mask() if causal_attn else None) #still causal mask (L,L)
         self.ln_final = LayerNorm(width)
-        self.text_projection = nn.Parameter(
+        self.text_projection = bmt.DistributedParameter(
                 torch.empty(width, embed_dim))
     
     @property
@@ -320,7 +306,7 @@ class X_Attn_Encoder(nn.Module):
         mask.triu_(1)  # zero out the lower diagonal
         return mask
     
-class CLIP(nn.Module):
+class CLIP_bm(bmt.DistributedModule):
     def __init__(self,
                  embed_dim: int,
                  # vision
@@ -371,18 +357,18 @@ class CLIP(nn.Module):
         self.vocab_size = vocab_size
         self.transformer_width = transformer_width
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
-        self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
+        self.positional_embedding = bmt.DistributedParameter(torch.empty(self.context_length, transformer_width))
         self.ln_final = LayerNorm(transformer_width)
 
-        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.text_projection = bmt.DistributedParameter(torch.empty(transformer_width, embed_dim))
+        self.logit_scale = bmt.DistributedParameter(torch.ones([]) * np.log(1 / 0.07))
         self.initialize_parameters()
 
     def initialize_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
 
-        if isinstance(self.visual, ModifiedResNet):
+        if False and isinstance(self.visual, ModifiedResNet):
             if self.visual.attnpool is not None:
                 std = self.visual.attnpool.c_proj.in_features ** -0.5
                 nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std)
@@ -399,6 +385,7 @@ class CLIP(nn.Module):
         attn_std = self.transformer.width ** -0.5
         fc_std = (2 * self.transformer.width) ** -0.5
         for block in self.transformer.resblocks:
+            continue
             nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
             nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
@@ -429,6 +416,7 @@ class CLIP(nn.Module):
             return image_embed
 
     def encode_text(self, text, n_layer_1=-1):
+        print(text.shape, text[0])
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
@@ -467,7 +455,7 @@ class CLIP(nn.Module):
         return logits_per_image, logits_per_text
 
 
-def convert_weights(model: nn.Module):
+def convert_weights(model: bmt.DistributedModule):
     """Convert applicable model parameters to fp16"""
 
     def _convert_weights_to_fp16(l):
@@ -491,7 +479,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict, return_full_embed = False, toolkit = 'torch'):
+def build_model(state_dict: dict, return_full_embed = False):
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -516,20 +504,12 @@ def build_model(state_dict: dict, return_full_embed = False, toolkit = 'torch'):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
-    if toolkit=='torch':
-        model = CLIP(
-            embed_dim,
-            image_resolution, vision_layers, vision_width, vision_patch_size,
-            context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
-            return_full_embed=return_full_embed
-        )
-    elif toolkit=='bm':
-        model = CLIP_bm(
-            embed_dim,
-            image_resolution, vision_layers, vision_width, vision_patch_size,
-            context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
-            return_full_embed=return_full_embed
-        )
+    model = CLIP(
+        embed_dim,
+        image_resolution, vision_layers, vision_width, vision_patch_size,
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
+        return_full_embed=return_full_embed
+    )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
