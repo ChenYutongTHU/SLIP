@@ -59,6 +59,9 @@ class TSVFile(object):
         self.lineidx = op.splitext(tsv_file)[0] + '.lineidx'
         self._fp = None
         self._lineidx = None
+    
+    def __len__(self):
+        return self.num_rows()
 
     def num_rows(self):
         self._ensure_lineidx_loaded()

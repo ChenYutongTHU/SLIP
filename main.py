@@ -37,10 +37,12 @@ from model_center.dataset import DistributedDataLoader
 def get_args_parser():
     parser = argparse.ArgumentParser(description='SLIP training and evaluation', add_help=False)
     parser.add_argument('--eval_freq', type=int, default=1)
+    parser.add_argument('--save_per_step', type=int, default=10000)
     parser.add_argument('--toolkit', default='torch', help='torch or bm')
     parser.add_argument('--toolkit_data', default='torch')
     # Data
     parser.add_argument('--dataset', default='yfcc15m', type=str)#, choices=['yfcc15m', 'cc3m', 'cc12m', 'coco', 'redcaps'])
+    parser.add_argument('--read_tsv', action='store_true')
     parser.add_argument('--need_only_text', action='store_true')    
     parser.add_argument('--root', default='', type=str,
                         help='path to dataset root')
@@ -58,7 +60,8 @@ def get_args_parser():
                         help='loss scale for SimCLR objective')
     parser.add_argument('--ssl-temp', default=0.1, type=float,
                         help='softmax temperature for SimCLR objective')
-    parser.add_argument('--resume', default='', type=str, help='path to resume from')
+    parser.add_argument('--resume', type=str, default='', help='path to resume from')
+    parser.add_argument('--reset_optimization', action='store_true', help='not resume epoch')
     # Training
     parser.add_argument('--epochs', default=25, type=int)
     parser.add_argument('--warmup-epochs', default=1, type=int)
@@ -145,15 +148,18 @@ def main(args):
         if os.path.isfile(args.resume):
             print("=> loading resume checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume, map_location='cpu')
-            epoch = checkpoint['epoch'] if 'epoch' in checkpoint else 0
-            args.start_epoch = epoch
             result = model.load_state_dict(checkpoint['state_dict'], strict=False)
             print(result)
-            optimizer.load_state_dict(checkpoint['optimizer']) if 'optimizer' in checkpoint else ()
-            scaler.load_state_dict(checkpoint['scaler']) if 'scaler' in checkpoint else ()
-            best_acc1 = checkpoint['best_acc1']
-            print("=> loaded resume checkpoint '{}' (epoch {})"
-                  .format(args.resume, epoch))
+            if args.reset_optimization:
+                args.start_epoch, epoch = 0, 0
+            else:
+                epoch = checkpoint['epoch'] if 'epoch' in checkpoint else 0
+                args.start_epoch = epoch
+                optimizer.load_state_dict(checkpoint['optimizer']) if 'optimizer' in checkpoint else ()
+                scaler.load_state_dict(checkpoint['scaler']) if 'scaler' in checkpoint else ()
+                best_acc1 = checkpoint['best_acc1']
+            print("=> load resume checkpoint '{}' (epoch {})"
+                .format(args.resume, epoch))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
     else:
@@ -399,6 +405,17 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
                         'logit': logit_scale})
             progress.display(optim_iter)
 
+        if data_iter % args.save_per_step==0:
+            print("=> saving checkpoint")
+            utils.save_on_master({
+                    'epoch': epoch,
+                    'step': data_iter,
+                    'state_dict': model.state_dict(),
+                    'optimizer' : optimizer.state_dict(),
+                    'scaler': scaler.state_dict(),
+                    'best_acc1': best_acc1,
+                    'args': args,
+                }, False, args.output_dir)
     progress.synchronize()
     return {**{k: v.avg for k, v in metrics.items()},
             'lr': optimizer.param_groups[0]['lr'],

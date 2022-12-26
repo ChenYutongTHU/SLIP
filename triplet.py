@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 from collections import defaultdict
-import wukong, clip
+import wukong, clip, mengzi
 from clip.model import Transformer, X_Attn_Encoder
 from copy import deepcopy
 import numpy as np
@@ -46,9 +46,18 @@ class Triplet(torch.nn.Module):
         self.use_allgather = cfg['use_allgather']
         self.model_en, self.preprocess = clip.load(cfg['Model_En'], device=device)
         self.tokenize_en = clip.tokenize
-        self.model_zh, self.tokenize_zh = wukong.load(pkl_path=cfg['Model_Zh'],device=device,lang='zh',context_length=32)
-        
-        self.visual = deepcopy(self.model_en.visual)
+        if 'wukong' in cfg['Model_Zh'].lower():
+            self.model_zh_type = 'wukong'
+            self.model_zh, self.tokenize_zh = wukong.load(pkl_path=cfg['Model_Zh'],device=device,lang='zh',context_length=32)
+        elif 'mengzi' in cfg['Model_Zh'].lower():
+            self.model_zh_type = 'mengzi'
+            output_dim = self.model_en.embed_dim
+            self.model_zh, self.tokenize_zh = mengzi.load(model_path=cfg['Model_Zh'], device=device, output_dim=output_dim, context_length=32)
+        DEBUG=False
+        if DEBUG:
+            self.visual = deepcopy(self.model_zh.visual)
+        else:
+            self.visual = deepcopy(self.model_en.visual)
         del self.visual.proj
         self.visual.proj = None
         
@@ -72,18 +81,21 @@ class Triplet(torch.nn.Module):
             self.visual_proj.data = self.visual_proj.data.half()            
         
         del self.model_en.visual
-        del self.model_zh.visual
+        if self.model_zh_type=='wukong':
+            del self.model_zh.visual
 
         if cfg['logit_scale'] == 'scratch':
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         elif cfg['logit_scale'] == 'load_en':
             self.logit_scale = deepcopy(self.model_en.logit_scale) #4.61
         elif cfg['logit_scale'] == 'load_zh':
+            assert self.model_zh_type=='wukong'
             self.logit_scale = deepcopy(self.model_zh.logit_scale) #4.30    
         else:
             self.logit_scale = nn.Parameter(torch.ones([]) * float(cfg['logit_scale']))     
         del self.model_en.logit_scale
-        del self.model_zh.logit_scale
+        if self.model_zh_type=='wukong':
+            del self.model_zh.logit_scale
         
         print('Logit_scale={:.2f}({}) Visual_proj={}'.format(self.logit_scale, cfg['logit_scale'], cfg['visual_proj']))
         # self.contrastive_type = cfg['contrastive_type']
@@ -96,7 +108,7 @@ class Triplet(torch.nn.Module):
             print('Share text encoder')
             # del self.model_zh
             # self.model_zh = self.model_en    
-            assert self.model_zh.context_length<=self.model_en.context_length #32,77
+            assert self.model_zh.context_length<=self.model_en.context_length and self.model_zh_type=='wukong' #32,77
             assert cfg.get('from_scratch', False)==True
             del self.model_zh.transformer 
             del self.model_zh.positional_embedding
@@ -150,11 +162,14 @@ class Triplet(torch.nn.Module):
             freeze_params(self.model_en) #text encoder (en)
             freeze_params(self.visual) #visual encoder
             if 'zh_text_encoder' in cfg['trainable_modules']:
-                unfreeze_params(self.model_zh.transformer)
-                unfreeze_params(self.model_zh.token_embedding)
-                self.model_zh.positional_embedding.requires_grad = True
-                unfreeze_params(self.model_zh.ln_final)
-                self.model_zh.text_projection.requires_grad = True
+                if self.model_zh_type=='mengzi':
+                    unfreeze_params(self.model_zh)
+                else:
+                    unfreeze_params(self.model_zh.transformer)
+                    unfreeze_params(self.model_zh.token_embedding)
+                    self.model_zh.positional_embedding.requires_grad = True
+                    unfreeze_params(self.model_zh.ln_final)
+                    self.model_zh.text_projection.requires_grad = True
             if 'zh_text_projection' in cfg['trainable_modules']:
                 self.model_zh.text_projection.requires_grad = True
             if 'en_text_projection' in cfg['trainable_modules']:
@@ -175,7 +190,8 @@ class Triplet(torch.nn.Module):
                     print(n)
         if cfg.get('reinitialize_modules', [])!=[]:
             if 'zh_text_projection' in cfg['reinitialize_modules']:
-                nn.init.normal_(self.model_zh.text_projection, std=self.model_zh.transformer.width ** -0.5) 
+                if self.model_zh_type == 'wukong':
+                    nn.init.normal_(self.model_zh.text_projection, std=self.model_zh.transformer.width ** -0.5) 
 
         if 'x_attn_encoder' in cfg:
             self.self_attn_layers = self.model_zh.transformer.layers-cfg['x_attn_encoder']['layers']
@@ -283,7 +299,7 @@ class Triplet(torch.nn.Module):
                 loss_dict['total'] += loss_weight*loss_dict[loss_key]
             elif '|' in loss_key:
                 #one-two loss
-                assert 'bi_text' in features_dict, 'do not support one-two loss for x_attn'
+                assert 'bi_text' not in features_dict, 'do not support one-two loss for x_attn'
                 k0k1k2, one_two_loss_mode = loss_key.split('#')
                 k0, k1k2 = k0k1k2.split('->')
                 k1,k2 = sorted(k1k2.split('|'))
