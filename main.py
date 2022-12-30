@@ -271,7 +271,7 @@ def main(args):
         if args.distributed and args.toolkit=='torch':
             train_sampler.set_epoch(epoch)
         # train for one epoch
-        train_stats = train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args)
+        train_stats = train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer)
 
         if (epoch + 1) % args.eval_freq != 0:
             continue
@@ -304,7 +304,7 @@ def main(args):
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in val_stats.items()},
-                     'epoch': epoch}
+                     'epoch': epoch, 'step':len(train_loader)}
 
         if utils.is_main_process():
             if args.wandb:
@@ -313,7 +313,7 @@ def main(args):
                 f.write(json.dumps(log_stats) + '\n')
 
 
-def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args):
+def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer):
     batch_time = AverageMeter('Time', ':6.2f')
     data_time = AverageMeter('Data', ':6.2f')
     mem = AverageMeter('Mem (GB)', ':6.1f')
@@ -406,6 +406,22 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
             progress.display(optim_iter)
 
         if data_iter % args.save_per_step==0:
+            if args.model.startswith('SIMCLR'):
+                val_stats = {'acc1': -1}
+                acc1 = -1
+            elif args.model in ['TRIPLET']:
+                val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+                acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
+                            val_stats['zh+en_logits_acc1'], 
+                            val_stats['zh^en_logits_acc1'], 
+                            val_stats['zh+en_probs_acc1'])
+            else:
+                val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
+                acc1 = val_stats['acc1']
+
+            global best_acc1
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
             print("=> saving checkpoint")
             utils.save_on_master({
                     'epoch': epoch,
@@ -415,7 +431,17 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
                     'scaler': scaler.state_dict(),
                     'best_acc1': best_acc1,
                     'args': args,
-                }, False, args.output_dir)
+                }, is_best, args.output_dir)
+
+            log_stats = {**{f'test_{k}': v for k, v in val_stats.items()},
+                        'epoch': epoch, 'step':data_iter}
+
+            if utils.is_main_process():
+                # if args.wandb:
+                #     wandb.log(log_stats)
+                with open(os.path.join(args.output_dir, 'log.txt'), 'a') as f:
+                    f.write(json.dumps(log_stats) + '\n')
+
     progress.synchronize()
     return {**{k: v.avg for k, v in metrics.items()},
             'lr': optimizer.param_groups[0]['lr'],

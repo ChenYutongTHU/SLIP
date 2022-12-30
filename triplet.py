@@ -135,6 +135,7 @@ class Triplet(torch.nn.Module):
                         k = 'en_text->image|zh_text'
                     else:
                         k = 'zh_text->en_text|image'
+                    cfg['one_two_loss_mode'] = cfg.get('one_two_loss_mode','log_plus') 
                     if 'one_two_loss_mode' in cfg:
                         assert cfg['one_two_loss_mode'] in ['plus_log', 'log_plus', 'single_positive'], cfg['one_two_loss_mode']
                         k = k+'#'+cfg['one_two_loss_mode']
