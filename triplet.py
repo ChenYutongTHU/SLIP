@@ -157,6 +157,9 @@ class Triplet(torch.nn.Module):
         self.label_requires_grad = cfg['label_requires_grad']
         
         #convert_weights(self)
+        if cfg.get('freeze_visual', False) == True:
+            print('Freeze visual encoder')
+            freeze_params(self.visual)
         if cfg.get('trainable_modules', 'all')!='all':
             assert cfg.get('from_scratch', False)==False
             freeze_params(self.model_zh) #text encoder (zh)
@@ -207,6 +210,10 @@ class Triplet(torch.nn.Module):
             self.self_attn_layers = -1
             self.x_attn_encoder = None
 
+        self.use_en_text_encoder = cfg.get('use_en_text_encoder', True)
+        if self.use_en_text_encoder == False:
+            del self.model_en
+            
     #     self.model_weights_check()
 
     def build_attention_mask(self):
@@ -238,7 +245,7 @@ class Triplet(torch.nn.Module):
         return output
     
     def encode_image(self, img):
-        img_x = self.visual(img.type(self.model_en.dtype))[:,0,:] #B,D
+        img_x = self.visual(img.type(self.model_zh.dtype))[:,0,:] #B,D
         image_features = img_x @ self.visual_proj
         return image_features
     
@@ -246,11 +253,18 @@ class Triplet(torch.nn.Module):
         return x/(x.norm(dim=-1, keepdim=True)+eps)
     
     def encode_text(self, zh, en):
-        zh_text_features, zh_text_features_imme, zh_eot = self.model_zh.encode_text(zh, self.self_attn_layers)
-        zh_text_features = self.normalize(zh_text_features, eps=1e-10)
-        en_text_features, en_text_features_imme, en_eot = self.model_en.encode_text(en, self.self_attn_layers)
-        en_text_features = self.normalize(en_text_features, eps=1e-10)
+        if zh is not None:
+            zh_text_features, zh_text_features_imme, zh_eot = self.model_zh.encode_text(zh, self.self_attn_layers)
+            zh_text_features = self.normalize(zh_text_features, eps=1e-10)
+        else:
+            zh_text_features = None
         
+        if en is not None and self.use_en_text_encoder:
+            en_text_features, en_text_features_imme, en_eot = self.model_en.encode_text(en, self.self_attn_layers)
+            en_text_features = self.normalize(en_text_features, eps=1e-10)
+        else:
+            en_text_features = None
+
         if self.x_attn_encoder is not None:
             bi_text_features = self.x_attn_encoder(zh=zh_text_features_imme, en=en_text_features_imme,
                     zh_eot=zh_eot, en_eot=en_eot)
@@ -268,7 +282,7 @@ class Triplet(torch.nn.Module):
         loss_dict['total'] = loss_dict['distillation']
         return loss_dict
     
-    def forward(self, en, zh, img=None):
+    def forward(self, en=None, zh=None, img=None):
         if self.only_distillation and img==None:
             return self.forward_only_distillation(en=en, zh=zh), {}, {}
         image_features = self.encode_image(img)
@@ -279,11 +293,10 @@ class Triplet(torch.nn.Module):
         logit_scale = self.logit_scale.exp()
         logit_scale.data = torch.clamp(logit_scale.data, max=100)
 
-        features_dict = {'image': image_features, 
-                         'zh_text': zh_text_features,
-                         'en_text': en_text_features}
-        if bi_text_features is not None:
-            features_dict['bi_text'] = bi_text_features
+        features_dict = {'image': image_features}
+        for k,v in [['zh_text',zh_text_features], ['en_text',en_text_features], ['bi_text',bi_text_features]]:
+            if v is not None:   
+                features_dict[k] = v
 
         loss_dict = {'total':0}
         acc_dict = {}

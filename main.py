@@ -37,6 +37,7 @@ from model_center.dataset import DistributedDataLoader
 def get_args_parser():
     parser = argparse.ArgumentParser(description='SLIP training and evaluation', add_help=False)
     parser.add_argument('--eval_freq', type=int, default=1)
+    parser.add_argument('--eval_metric', default='zh_acc1')
     parser.add_argument('--save_per_step', type=int, default=10000)
     parser.add_argument('--toolkit', default='torch', help='torch or bm')
     parser.add_argument('--toolkit_data', default='torch')
@@ -262,16 +263,19 @@ def main(args):
         wandb.run.save()
 
     print(args)
-    # if args.model in ['TRIPLET']:
-    #     print("=> Evaluation before training")
-    #     val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-    #     print(val_stats)
+    if args.model in ['TRIPLET']:
+        print("=> Evaluation before training")
+        val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+        print(val_stats)
+        val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+        # print(val_stats)
     print("=> beginning training")
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed and args.toolkit=='torch':
             train_sampler.set_epoch(epoch)
         # train for one epoch
-        train_stats = train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer)
+        train_stats = train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args, 
+            val_loader, tokenizer, val_transform)
 
         if (epoch + 1) % args.eval_freq != 0:
             continue
@@ -281,10 +285,15 @@ def main(args):
             acc1 = -1
         elif args.model in ['TRIPLET']:
             val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-            acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
-                        val_stats['zh+en_logits_acc1'], 
-                        val_stats['zh^en_logits_acc1'], 
-                        val_stats['zh+en_probs_acc1'])
+            if args.eval_metric=='max':
+                acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
+                            val_stats['zh+en_logits_acc1'], 
+                            val_stats['zh^en_logits_acc1'], 
+                            val_stats['zh+en_probs_acc1']) 
+            else:
+                acc1 = val_stats[args.eval_metric]
+            val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+
         else:
             val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
             acc1 = val_stats['acc1']
@@ -313,7 +322,7 @@ def main(args):
                 f.write(json.dumps(log_stats) + '\n')
 
 
-def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer):
+def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer, val_transform):
     batch_time = AverageMeter('Time', ':6.2f')
     data_time = AverageMeter('Data', ':6.2f')
     mem = AverageMeter('Mem (GB)', ':6.1f')
@@ -415,6 +424,7 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
                             val_stats['zh+en_logits_acc1'], 
                             val_stats['zh^en_logits_acc1'], 
                             val_stats['zh+en_probs_acc1'])
+                val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
             else:
                 val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
                 acc1 = val_stats['acc1']
@@ -473,10 +483,14 @@ def validate_retrieval_bilingual_text(model, tokenizer, args):
                         utils.get_model(model).encode_text(
                             zh=batch['zh'].squeeze(1).cuda(), 
                             en=batch['en'].squeeze(1).cuda())
-                zh_embeddings_all.append(zh_embeddings)
-                en_embeddings_all.append(en_embeddings)
-            en_embeddings_all = torch.cat(en_embeddings_all, dim=0)
-            zh_embeddings_all = torch.cat(zh_embeddings_all, dim=0) #1k, 512
+                if zh_embeddings is not None:
+                    zh_embeddings_all.append(zh_embeddings)
+                if en_embeddings is not None:
+                    en_embeddings_all.append(en_embeddings)
+            if en_embeddings_all != []:
+                en_embeddings_all = torch.cat(en_embeddings_all, dim=0)
+            if zh_embeddings_all != []:
+                zh_embeddings_all = torch.cat(zh_embeddings_all, dim=0) #1k, 512
             
             #retrieval
             sim_en_zh = en_embeddings_all@zh_embeddings_all.t() #1k en, 1k zh
@@ -515,7 +529,7 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
         'aic': '/data11/private/chenyutong/data/aic/caption_validation_images_20170910/{}.jpg'
     }
     if utils.is_main_process(): #one gpu is enough
-        for dataset in ['coco-cn','aic']:
+        for dataset in ['coco-cn']:#,'aic']:
             print(f'Evaluate Img<->Text Retrieval on {dataset} ...')
             with open(DATASET2FILE[dataset],'r') as f:
                 img2captions = json.load(f)
@@ -558,13 +572,10 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
                 zh_embeddings_all.append(zh_embeddings)
                 bi_embeddings_all.append(bi_embeddings)
             image_embeddings_all = torch.cat(image_embeddings_all, dim=0)
-            en_embeddings_all = torch.cat(en_embeddings_all, dim=0)
-            zh_embeddings_all = torch.cat(zh_embeddings_all, dim=0) #1k, 512
-            text_embeddings = {'zh': zh_embeddings_all, 'en':en_embeddings_all}
-            if bi_embeddings is not None:
-                bi_embeddings_all = torch.cat(bi_embeddings_all, dim=0)
-                text_embeddings['bi'] = bi_embeddings_all
-            print(image_embeddings_all.shape, en_embeddings_all.shape, zh_embeddings_all.shape)
+            text_embeddings = {}
+            for k,v in [['zh',zh_embeddings_all],['en',en_embeddings_all],['bi',bi_embeddings_all]]:
+                if v[-1] is not None:
+                    text_embeddings[k] = torch.cat(v, dim=0)
             for lang in ['zh','en','bi']:
                 if not lang in text_embeddings:
                     continue
@@ -623,23 +634,17 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
             zh_embeddings, en_embeddings, bi_embeddings = utils.get_model(model).encode_text(
                     zh=id2lang_text[id]['zh'].cuda(args.gpu, non_blocking=True), 
                     en=id2lang_text[id]['en'].cuda(args.gpu, non_blocking=True)) 
-            #print('beform norm', torch.nn.functional.mse_loss(zh_embeddings, en_embeddings, reduction='mean'))
-            zh_embeddings, en_embeddings = zh_embeddings.mean(dim=0), en_embeddings.mean(dim=0)
-            en_embeddings = en_embeddings / en_embeddings.norm(dim=-1, keepdim=True)
-            lang2text_features['en'].append(en_embeddings)
-            zh_embeddings = zh_embeddings / zh_embeddings.norm(dim=-1, keepdim=True)
-            lang2text_features['zh'].append(zh_embeddings)
-            #print('after norm', torch.nn.functional.mse_loss(zh_embeddings, en_embeddings, reduction='mean'))
-            if bi_embeddings is not None:
-                if not 'bi' in lang2text_features:
-                    lang2text_features['bi'] = []
-                bi_embeddings = bi_embeddings.mean(dim=0)
-                bi_embeddings = bi_embeddings / bi_embeddings.norm(dim=-1, keepdim=True)
-                lang2text_features['bi'].append(bi_embeddings)
+            for k,v in [['zh', zh_embeddings],['en', en_embeddings]]:
+                if v is not None:
+                    v = v.mean(dim=0)
+                    v = v/v.norm(dim=-1, keepdim=True)
+                    lang2text_features[k].append(v)
+            
         for k in lang2text_features:
             if len(lang2text_features[k])==0:
                 continue
             lang2text_features[k] = torch.stack(lang2text_features[k], dim=0)
+        lang2text_features = {k:v for k,v in lang2text_features.items() if len(v)}
         end = time.time()
         SAVE = True
         if SAVE:
@@ -648,6 +653,8 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
         logit_scale.data = torch.clamp(logit_scale.data, max=100)
         print('=> encoding images and compute similarities')
         for i, (images, target, fnames) in enumerate(val_loader):
+            # if i>=5:
+            #     break
             images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
 
@@ -670,57 +677,64 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
                 top5['bi'].update(0, images.size(0))
 
             #bilingual ensemble
-            if SAVE:
-                for fname, logits_zh, logits_en in zip(fnames, logits_per_image['zh'], logits_per_image['en']):
-                    fname2logits[fname] = {'zh':logits_zh.cpu(), 'en':logits_en.cpu()}
+            if 'zh' in lang2text_features and 'en' in lang2text_features:
+                if SAVE:
+                    for fname, logits_zh, logits_en in zip(fnames, logits_per_image['zh'], logits_per_image['en']):
+                        fname2logits[fname] = {'zh':logits_zh.cpu(), 'en':logits_en.cpu()}
 
-            logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en'] #B,V
-            acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
-            acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-            top1['zh+en_logits'].update(acc1.item(), images.size(0))
-            top5['zh+en_logits'].update(acc5.item(), images.size(0))    
-
-            if 'bi' in logits_per_image:
-                logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en']+logits_per_image['bi'] #B,V
+                logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en'] #B,V
                 acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
                 acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-                top1['zh+en+bi_logits'].update(acc1.item(), images.size(0))
-                top5['zh+en+bi_logits'].update(acc5.item(), images.size(0))
-            else:
-                top1['zh+en+bi_logits'].update(0, images.size(0))
-                top5['zh+en+bi_logits'].update(0, images.size(0))                        
+                top1['zh+en_logits'].update(acc1.item(), images.size(0))
+                top5['zh+en_logits'].update(acc5.item(), images.size(0))    
 
-            logits_per_image_bilingual =  torch.stack([logits_per_image['zh'],logits_per_image['en']], dim=-1)  #B,V,2
-            logits_per_image_bilingual = torch.max(logits_per_image_bilingual, dim=-1).values  
-            acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
-            acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-            top1['zh^en_logits'].update(acc1.item(), images.size(0))
-            top5['zh^en_logits'].update(acc5.item(), images.size(0))
+                if 'bi' in logits_per_image:
+                    logits_per_image_bilingual = logits_per_image['zh']+logits_per_image['en']+logits_per_image['bi'] #B,V
+                    acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
+                    acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+                    top1['zh+en+bi_logits'].update(acc1.item(), images.size(0))
+                    top5['zh+en+bi_logits'].update(acc5.item(), images.size(0))
+                else:
+                    top1['zh+en+bi_logits'].update(0, images.size(0))
+                    top5['zh+en+bi_logits'].update(0, images.size(0))                        
 
-            probs_per_image_bilingual = probs_per_image['zh']+probs_per_image['en'] #B,V
-            acc1, acc5 = accuracy(probs_per_image_bilingual, target, topk=(1, 5))
-            acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-            top1['zh+en_probs'].update(acc1.item(), images.size(0))
-            top5['zh+en_probs'].update(acc5.item(), images.size(0)) 
+                logits_per_image_bilingual =  torch.stack([logits_per_image['zh'],logits_per_image['en']], dim=-1)  #B,V,2
+                logits_per_image_bilingual = torch.max(logits_per_image_bilingual, dim=-1).values  
+                acc1, acc5 = accuracy(logits_per_image_bilingual, target, topk=(1, 5))
+                acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+                top1['zh^en_logits'].update(acc1.item(), images.size(0))
+                top5['zh^en_logits'].update(acc5.item(), images.size(0))
 
-            if 'bi' in probs_per_image:
-                probs_per_image_bilingual = probs_per_image['zh']+probs_per_image['en']+probs_per_image['bi'] #B,V
+                probs_per_image_bilingual = probs_per_image['zh']+probs_per_image['en'] #B,V
                 acc1, acc5 = accuracy(probs_per_image_bilingual, target, topk=(1, 5))
                 acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-                top1['zh+en+bi_probs'].update(acc1.item(), images.size(0))
-                top5['zh+en+bi_probs'].update(acc5.item(), images.size(0)) 
+                top1['zh+en_probs'].update(acc1.item(), images.size(0))
+                top5['zh+en_probs'].update(acc5.item(), images.size(0)) 
+
+                if 'bi' in probs_per_image:
+                    probs_per_image_bilingual = probs_per_image['zh']+probs_per_image['en']+probs_per_image['bi'] #B,V
+                    acc1, acc5 = accuracy(probs_per_image_bilingual, target, topk=(1, 5))
+                    acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+                    top1['zh+en+bi_probs'].update(acc1.item(), images.size(0))
+                    top5['zh+en+bi_probs'].update(acc5.item(), images.size(0)) 
+                else:
+                    top1['zh+en+bi_probs'].update(0, images.size(0))
+                    top5['zh+en+bi_probs'].update(0, images.size(0))
+                # measure elapsed time
             else:
-                top1['zh+en+bi_probs'].update(0, images.size(0))
-                top5['zh+en+bi_probs'].update(0, images.size(0))
-            # measure elapsed time
+                for k in ['zh+en_logits', 'zh^en_logits', 'zh+en_probs','bi','zh+en+bi_logits','zh+en+bi_probs','zh','en']:
+                    if k in lang2text_features:
+                        continue
+                    top1[k].update(0, images.size(0))
+                    top5[k].update(0, images.size(0)) 
             batch_time.update(time.time() - end)
             end = time.time()
 
             if i % args.print_freq == 0:
                 progress.display(i)
+            if SAVE:
+                torch.save(fname2logits, os.path.join(args.output_dir,f'fname2logits_rank{get_rank()}.bin'))
 
-        if SAVE:
-            torch.save(fname2logits, os.path.join(args.output_dir,f'fname2logits_rank{get_rank()}.bin'))
 
     progress.synchronize()
     return_dict = {}
