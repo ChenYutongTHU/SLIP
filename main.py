@@ -263,11 +263,11 @@ def main(args):
         wandb.run.save()
 
     print(args)
-    if args.model in ['TRIPLET']:
-        print("=> Evaluation before training")
-        val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-        print(val_stats)
-        val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+    # if args.model in ['TRIPLET']:
+    #     print("=> Evaluation before training")
+    #     val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+    #     print(val_stats)
+    #     val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
         # print(val_stats)
     print("=> beginning training")
     for epoch in range(args.start_epoch, args.epochs):
@@ -292,7 +292,7 @@ def main(args):
                             val_stats['zh+en_probs_acc1']) 
             else:
                 acc1 = val_stats[args.eval_metric]
-            val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+            validate_retrieval_bilingual(model, val_transform, tokenizer, args)
 
         else:
             val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
@@ -424,7 +424,7 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
                             val_stats['zh+en_logits_acc1'], 
                             val_stats['zh^en_logits_acc1'], 
                             val_stats['zh+en_probs_acc1'])
-                val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+                validate_retrieval_bilingual(model, val_transform, tokenizer, args)
             else:
                 val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
                 acc1 = val_stats['acc1']
