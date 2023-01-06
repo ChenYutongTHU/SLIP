@@ -376,6 +376,13 @@ def all_gather_batch(tensors):
     return output_tensor
 
 
+
+def all_gather_tensor(tensor):
+    y = [tensor.new(*tensor.size()) for _ in range(get_world_size())]
+    dist.all_gather(y, tensor)
+    y = torch.cat(y, 0)
+    return y
+
 class GatherLayer(autograd.Function):
     """
     Gather tensors from all workers with support for backward propagation:

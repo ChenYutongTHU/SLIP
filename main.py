@@ -414,7 +414,7 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
                         'logit': logit_scale})
             progress.display(optim_iter)
 
-        if data_iter % args.save_per_step==0:
+        if data_iter % args.save_per_step==0 and data_iter!=0:
             if args.model.startswith('SIMCLR'):
                 val_stats = {'acc1': -1}
                 acc1 = -1
@@ -518,6 +518,7 @@ def validate_retrieval_bilingual_text(model, tokenizer, args):
                         f.writelines('\n')    
                 print('Write some samples in '+os.path.join(args.output_dir, f'retrieve_{dataset}_{direction}.txt'))
 
+
 def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
     model.eval()
     DATASET2FILE = {
@@ -528,8 +529,107 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
         'coco-cn': 'data/coco_cn/coco_cn_test_images/{}.jpg', #.format(img_id)
         'aic': '/data11/private/chenyutong/data/aic/caption_validation_images_20170910/{}.jpg'
     }
+    for dataset in ['coco-cn','aic']:
+        print(f'Evaluate Img<->Text Retrieval on {dataset} ...')
+        with open(DATASET2FILE[dataset],'r') as f:
+            img2captions = json.load(f)
+
+        img_ids, zh_caps, en_caps, pt = [], [], [], 0
+        img_files = []
+        imgid2capid, capid2imgid = [], []
+        for img_id, c in img2captions.items():
+            capid2imgid.extend([len(img_ids)]*len(c['zh']))
+            img_ids.append(img_id)
+            img_files.append(DATASET2IMG[dataset].format(img_id))
+            #zh_caps.append(c['zh']) #a list?
+            #en_caps.append(c['en'])
+            imgid2capid.append(np.arange(pt, pt+len(c['zh'])))
+            pt += len(c['zh'])
+            assert len(c['zh'])==len(c['en'])
+            zh_caps.append(c['zh'])
+            en_caps.append(c['en'])
+        print('#Images={}, #Captions={}'.format(len(img_files), pt))
+        #manually split
+        chunk_size = math.ceil(len(img_files)/get_world_size())
+        left, right = get_rank()*chunk_size, min((get_rank()+1)*chunk_size, len(img_files))
+        img_files_, zh_caps_, en_caps_ = img_files[left:right], zh_caps[left:right], en_caps[left:right]
+        if right-left<chunk_size:
+            img_files_ +=[img_files[-1] for _ in range(right-left, chunk_size)]
+            zh_caps_ +=[zh_caps[-1] for _ in range(right-left, chunk_size)]
+            en_caps_ +=[en_caps[-1] for _ in range(right-left, chunk_size)]
+        val_dataset = datasets.TripletDataset_from_rawfile(
+            img_file=img_files_, zh=zh_caps_, en=en_caps_, preprocess=val_transform, tokenizer=tokenizer)
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=128, shuffle=False,
+                num_workers=args.workers, pin_memory=True, drop_last=False)
+
+        print('Compute embeddings ... rank={}, #samples={} #batch={}'.format(get_rank(), len(val_dataset), len(val_dataloader)), force=True)
+        image_embeddings_all = []
+        en_embeddings_all, zh_embeddings_all, bi_embeddings_all = [], [], []
+        for img, en, zh in tqdm(val_dataloader):
+            #B,k,L
+            en, zh = en.reshape(-1,en.shape[-1]), zh.reshape(-1,zh.shape[-1])
+            #en, zh = en.squeeze(1), zh.squeeze(1) #
+            with torch.no_grad():
+                image_features = utils.get_model(model).encode_image(img.cuda())
+                zh_embeddings, en_embeddings, bi_embeddings = \
+                    utils.get_model(model).encode_text(zh=zh.cuda(), en=en.cuda()) #already normalize
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            image_embeddings_all.append(image_features)
+            en_embeddings_all.append(en_embeddings)
+            zh_embeddings_all.append(zh_embeddings)
+            bi_embeddings_all.append(bi_embeddings)
+        image_embeddings_all = torch.cat(image_embeddings_all, dim=0)
+
+        dist_synchronize()
+        image_embeddings_all = utils.all_gather_tensor(image_embeddings_all)
+        image_embeddings_all = image_embeddings_all[:len(img_files)]
+        text_embeddings = {}
+        for k,v in [['zh',zh_embeddings_all],['en',en_embeddings_all],['bi',bi_embeddings_all]]:
+            if v[-1] is not None:
+                text_embeddings[k] = torch.cat(v, dim=0)
+                text_embeddings[k] = utils.all_gather_tensor(text_embeddings[k])
+                text_embeddings[k] = text_embeddings[k][:len(img_files)]
+        #print('image_embeddings={}, zh_embeddings={}, rank={}, #_batch={}'.format(image_embeddings_all.shape, text_embeddings['zh'].shape, get_rank(), len(val_dataloader)), force=True)
+                print(image_embeddings_all.shape, k, text_embeddings[k].shape)
+        #gather
+        for lang in ['zh','en','bi']:
+            if not lang in text_embeddings:
+                continue
+            #direction Image->Text
+            acc1, acc5 = [], []
+            for i, (image_embedding, capids) in enumerate(zip(image_embeddings_all, imgid2capid)):
+                i2t_sim = image_embedding@text_embeddings[lang].t() #D,(D,nT)
+                pred_topk = (torch.topk(i2t_sim, k=5, dim=-1).indices).tolist()
+                acc1.append(pred_topk[0] in capids)
+                acc5.append(np.max([cid in pred_topk for cid in capids]))
+            acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
+            print('{}({}) acc1={:.2f} acc5={:.2f}'.format('Image->Text', lang, acc1, acc5))
+            #direction Text->Image
+            acc1, acc5 = [], []
+            for i, (text_embedding, imgid) in enumerate(zip(text_embeddings[lang], capid2imgid)):
+                t2i_sim = text_embedding@image_embeddings_all.t()
+                pred_topk = (torch.topk(t2i_sim, k=5, dim=-1).indices).tolist()
+                acc1.append(pred_topk[0]==imgid)
+                acc5.append(imgid in pred_topk)    
+            acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
+            print('{}({}) acc1={:.2f} acc5={:.2f}'.format('Text->Image', lang, acc1, acc5))                                
+    #dist.barrier()
+    dist_synchronize()
+    model.train()
+
+def validate_retrieval_bilingual_single(model, val_transform, tokenizer, args):
+    model.eval()
+    DATASET2FILE = {
+        'coco-cn': 'data/coco_cn/coco_cn_test.json', #{'img_id':{'zh':,'en':}}
+        'aic':  '/data11/private/chenyutong/data/aic/aic_validation.json'
+    }
+    DATASET2IMG = {
+        'coco-cn': 'data/coco_cn/coco_cn_test_images/{}.jpg', #.format(img_id)
+        'aic': '/data11/private/chenyutong/data/aic/caption_validation_images_20170910/{}.jpg'
+    }
     if utils.is_main_process(): #one gpu is enough
-        for dataset in ['coco-cn']:#,'aic']:
+        for dataset in ['coco-cn','aic']:
             print(f'Evaluate Img<->Text Retrieval on {dataset} ...')
             with open(DATASET2FILE[dataset],'r') as f:
                 img2captions = json.load(f)

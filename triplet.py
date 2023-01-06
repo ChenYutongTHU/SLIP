@@ -358,7 +358,7 @@ class Triplet(torch.nn.Module):
                 loss, acc = criterion(logits)
                 loss_dict[loss_key] = loss
                 loss_dict['total'] += loss_weight*loss
-                acc_dict[loss_key] = acc         
+                acc_dict[loss_key] = acc       
         return loss_dict, features_dict, acc_dict
             
         
