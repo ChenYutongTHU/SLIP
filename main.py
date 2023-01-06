@@ -477,7 +477,7 @@ def validate_retrieval_bilingual_text(model, tokenizer, args):
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset, batch_size=128, shuffle=False, num_workers=args.workers, pin_memory=True, drop_last=False)          
             zh_embeddings_all, en_embeddings_all = [],[]
-            for batch in tqdm(val_dataloader):
+            for batch in tqdm(val_dataloader, disable=(not is_main_process()):
                 with torch.no_grad():
                     zh_embeddings, en_embeddings, bi_embeddings = \
                         utils.get_model(model).encode_text(
@@ -563,10 +563,9 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
             val_dataset, batch_size=128, shuffle=False,
                 num_workers=args.workers, pin_memory=True, drop_last=False)
 
-        print('Compute embeddings ... rank={}, #samples={} #batch={}'.format(get_rank(), len(val_dataset), len(val_dataloader)), force=True)
         image_embeddings_all = []
         en_embeddings_all, zh_embeddings_all, bi_embeddings_all = [], [], []
-        for img, en, zh in tqdm(val_dataloader):
+        for img, en, zh in tqdm(val_dataloader, disable=(not is_main_process()):
             #B,k,L
             en, zh = en.reshape(-1,en.shape[-1]), zh.reshape(-1,zh.shape[-1])
             #en, zh = en.squeeze(1), zh.squeeze(1) #
@@ -589,9 +588,8 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
             if v[-1] is not None:
                 text_embeddings[k] = torch.cat(v, dim=0)
                 text_embeddings[k] = utils.all_gather_tensor(text_embeddings[k])
-                text_embeddings[k] = text_embeddings[k][:len(img_files)]
-        #print('image_embeddings={}, zh_embeddings={}, rank={}, #_batch={}'.format(image_embeddings_all.shape, text_embeddings['zh'].shape, get_rank(), len(val_dataloader)), force=True)
-                print(image_embeddings_all.shape, k, text_embeddings[k].shape)
+                text_embeddings[k] = text_embeddings[k][:pt]
+                print(k, len(text_embeddings[k]))
         #gather
         for lang in ['zh','en','bi']:
             if not lang in text_embeddings:
@@ -658,7 +656,7 @@ def validate_retrieval_bilingual_single(model, val_transform, tokenizer, args):
             print('Compute embeddings ... ')
             image_embeddings_all = []
             en_embeddings_all, zh_embeddings_all, bi_embeddings_all = [], [], []
-            for img, en, zh in tqdm(val_dataloader):
+            for img, en, zh in tqdm(val_dataloader, disable=(not is_main_process())):
                 #B,k,L
                 en, zh = en.reshape(-1,en.shape[-1]), zh.reshape(-1,zh.shape[-1])
                 #en, zh = en.squeeze(1), zh.squeeze(1) #
