@@ -44,7 +44,10 @@ def get_args_parser():
     # Data
     parser.add_argument('--dataset', default='yfcc15m', type=str)#, choices=['yfcc15m', 'cc3m', 'cc12m', 'coco', 'redcaps'])
     parser.add_argument('--read_tsv', action='store_true')
-    parser.add_argument('--need_only_text', action='store_true')    
+    parser.add_argument('--need_only_text', action='store_true')  
+    parser.add_argument('--training_mode', default='auto')  
+    parser.add_argument('--dataset_distill', default='aic,coco_sbu_vg,cc3m,cc12m,tsl2019,newsv16,wikititles,wikimatrix,thunmt') 
+    parser.add_argument('--dataset_contrastive', default='cc3m') 
     parser.add_argument('--root', default='', type=str,
                         help='path to dataset root')
     parser.add_argument('--metadata', default='yfcc15m.pkl', type=str,
@@ -64,10 +67,19 @@ def get_args_parser():
     parser.add_argument('--resume', type=str, default='', help='path to resume from')
     parser.add_argument('--reset_optimization', action='store_true', help='not resume epoch')
     # Training
+    parser.add_argument('--training_unit', default='epoch')
+    parser.add_argument('--steps', default=1000, type=int)
+    parser.add_argument('--warmup-steps', default=100, type=int)
     parser.add_argument('--epochs', default=25, type=int)
     parser.add_argument('--warmup-epochs', default=1, type=int)
     parser.add_argument('--start-epoch', default=0, type=int)
     parser.add_argument('--batch-size', default=64, type=int,
+                        help='number of samples per-device/per-gpu')
+    parser.add_argument('--batch-size_eval', default=128, type=int,
+                        help='number of samples per-device/per-gpu')
+    parser.add_argument('--batch_size_distill', default=64, type=int,
+                        help='number of samples per-device/per-gpu')
+    parser.add_argument('--batch_size_contrastive', default=64, type=int,
                         help='number of samples per-device/per-gpu')
     parser.add_argument('--lr', default=3e-3, type=float)
     parser.add_argument('--lr-start', default=1e-6, type=float,
@@ -199,8 +211,27 @@ def main(args):
             normalize
         ])
 
-    train_dataset = datasets.get_dataset(train_transform, tokenizer, args)
-    
+    train_dataset = {}
+    if args.training_mode == 'auto':
+        if args.need_only_text:
+            args.training_mode = ['distill']
+            args.batch_size_distill = args.batch_size
+        else:
+            args.training_mode = ['contrastive']
+            args.batch_size_contrastive = args.batch_size
+    else:
+        args.training_mode = args.training_mode.split(',')
+    for k in args.training_mode:
+        if k=='distill':
+            train_dataset[k] = datasets.get_dataset(
+                    train_transform, tokenizer, args.dataset_distill, 
+                    args=args, need_only_text=True, read_tsv=True)
+        elif k=='contrastive':
+            train_dataset[k] = datasets.get_dataset(
+                    train_transform, tokenizer, args.dataset_contrastive, 
+                    args=args, need_only_text=False, read_tsv=True)
+        else:
+            raise ValueError
     '''
     cwd = os.path.dirname(os.path.realpath(__file__))
     with open(os.path.join(cwd, 'dataset_catalog.json')) as f:
@@ -215,19 +246,31 @@ def main(args):
     # make sure num_samples = 0 mod num_gpus for exact acc
 
     if args.toolkit in 'torch': #toolkit! instead of toolkit_data (dist.get_rank())
+        train_loader, train_sampler, train_iter, train_step = {}, {}, {}, {}
+        longest_dataset = None
+        args.mode2batch_size = {'distill':args.batch_size_distill, 'contrastive':args.batch_size_contrastive}
+        for k, d in train_dataset.items():
+            if args.distributed:
+                train_sampler[k] = torch.utils.data.distributed.DistributedSampler(d)
+            else:
+                train_sampler[k] = None
+            train_loader[k] = torch.utils.data.DataLoader(
+                d, batch_size=args.mode2batch_size[k], shuffle=(train_sampler[k] is None),
+                num_workers=args.workers, pin_memory=True, sampler=train_sampler[k], drop_last=True)
+            train_iter[k] = iter(train_loader[k])
+            train_step[k] = [0, len(train_loader[k]), 0] #current, total steps per epoch, cur_epoch
+            if longest_dataset==None or len(train_loader[k])>len(train_loader[longest_dataset]):
+                longest_dataset = k
+            print(f'Dataset {k}, #={len(train_dataset[k])}, #batch={len(train_loader[k])}, sampler-len{len(train_sampler[k])}')
         if args.distributed:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
             val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
         else:
-            train_sampler = None
             val_sampler = None
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
         val_loader = torch.utils.data.DataLoader(
-            val_dataset, batch_size=128, shuffle=(val_sampler is None),
+            val_dataset, batch_size=args.batch_size_eval, shuffle=(val_sampler is None),
             num_workers=args.workers, pin_memory=True, sampler=val_sampler, drop_last=False)
     elif args.toolkit=='bm': #(bm.get_rank())
+        raise ValueError
         train_loader = DistributedDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
         val_loader = DistributedDataLoader(val_dataset, batch_size=128, shuffle=False, 
             drop_last=False,num_workers=args.workers,pin_memory=True)
@@ -252,9 +295,14 @@ def main(args):
                 f.write(json.dumps(zero_stats) + '\n')
         return
 
-    lr_schedule = utils.cosine_scheduler(args.lr, args.lr_end, args.epochs,
-        len(train_loader) // args.update_freq, warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr_start)
-
+    if args.training_unit=='epoch':
+        lr_schedule = utils.cosine_scheduler_epoch(args.lr, args.lr_end, args.epochs,
+            len(train_loader[longest_dataset]) // args.update_freq, warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr_start)
+    elif args.training_unit=='step':
+        lr_schedule = utils.cosine_scheduler_step(args.lr, args.lr_end, args.steps,
+             warmup_steps=args.warmup_steps, start_warmup_value=args.lr_start)
+    else:
+        raise ValueError
     if utils.is_main_process() and args.wandb:
         wandb.login(key='5421ff43bf1e3a6e19103432d161c885d4bbeda8')
         #wandb_id = os.path.split(args.output_dir)[-1]
@@ -270,12 +318,19 @@ def main(args):
     #     val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
         # print(val_stats)
     print("=> beginning training")
+    if args.training_unit=='step':
+        args.epochs = math.ceil(args.steps/len(train_loader[longest_dataset]))
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed and args.toolkit=='torch':
-            train_sampler.set_epoch(epoch)
+            train_sampler[longest_dataset].set_epoch(epoch)
         # train for one epoch
-        train_stats = train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args, 
-            val_loader, tokenizer, val_transform)
+        if args.training_unit=='step':
+            end_step = args.steps-epoch*len(train_loader[longest_dataset])
+        else:
+            end_step = len(train_loader[longest_dataset])
+        train_stats = train(train_iter, train_step, train_sampler,
+            longest_dataset, model, criterion, optimizer, scaler, epoch, lr_schedule, args, 
+            val_loader, tokenizer, val_transform, end_step)
 
         if (epoch + 1) % args.eval_freq != 0:
             continue
@@ -292,8 +347,8 @@ def main(args):
                             val_stats['zh+en_probs_acc1']) 
             else:
                 acc1 = val_stats[args.eval_metric]
-            validate_retrieval_bilingual(model, val_transform, tokenizer, args)
-
+            val_stats_retrieval = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+            val_stats = {**val_stats, **val_stats_retrieval}
         else:
             val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
             acc1 = val_stats['acc1']
@@ -313,7 +368,7 @@ def main(args):
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in val_stats.items()},
-                     'epoch': epoch, 'step':len(train_loader)}
+                     'epoch': epoch, 'step':len(train_loader[longest_dataset])}
 
         if utils.is_main_process():
             if args.wandb:
@@ -321,13 +376,20 @@ def main(args):
             with open(os.path.join(args.output_dir, 'log.txt'), 'a') as f:
                 f.write(json.dumps(log_stats) + '\n')
 
+def get_next_batch(train_iter_, train_step_, train_sampler_):
+    cur_step, step_per_epoch ,cur_epoch = train_step_
+    if cur_step>=step_per_epoch:
+        train_sampler_.set_epoch(cur_epoch+1)
+        train_step_[2] += 1
+    train_step_[0] += 1
+    return next(train_iter_)
 
-def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer, val_transform):
+def train(train_iter, train_step, train_sampler, longest_dataset, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer, val_transform, end_step):
     batch_time = AverageMeter('Time', ':6.2f')
     data_time = AverageMeter('Data', ':6.2f')
     mem = AverageMeter('Mem (GB)', ':6.1f')
     metric_names = models.get_metric_names(args.model)
-    iters_per_epoch = len(train_loader) // args.update_freq
+    iters_per_epoch = len(train_iter[longest_dataset]) // args.update_freq
     metrics = OrderedDict([(name, AverageMeter(name, ':.2e')) for name in metric_names])
     if len(metrics):
         progress = ProgressMeter(
@@ -339,9 +401,12 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
     model.train()
 
     end = time.time()
-    for data_iter, inputs in enumerate(train_loader):
+    #train_iter = {k:iter(loader) for k, loader in train_loader.items()}
+    for data_iter in range(len(train_iter[longest_dataset])):
+        #inputs
         optim_iter = data_iter // args.update_freq
-
+        if optim_iter>=end_step:
+            break
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -349,31 +414,38 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         it = iters_per_epoch * epoch + optim_iter  # global training iteration
         for k, param_group in enumerate(optimizer.param_groups):
             param_group['lr'] = lr_schedule[it]
-        
-        if args.model not in ['TRIPLET']:
-            inputs = [tensor.cuda(args.gpu, non_blocking=True) for tensor in inputs]
 
-        # compute output
-        with amp.autocast(enabled=not args.disable_amp):
-            if args.model=='TRIPLET':
-                if args.toolkit=='bm':
-                    inputs = {k:tensor.cuda(args.gpu, non_blocking=True) for k,tensor in inputs.items()}
-                loss_dict, features_dict, acc_dict = model(
-                    img=inputs.get('img',None),
-                    en=inputs['en'].squeeze(1), zh=inputs['zh'].squeeze(1))
-                loss = loss_dict['total']
-                if len(metrics)==0:
-                    metrics = OrderedDict([(name, AverageMeter(name, ':.2e')) for name in list(loss_dict.keys())+list(acc_dict.keys())])
-                    progress = ProgressMeter(
-                        iters_per_epoch,
-                        [batch_time, data_time, mem, *metrics.values()],
-                        prefix="Epoch: [{}]".format(epoch))
-            else:
-                outputs = model(*inputs)
-                loss_dict = criterion(outputs)
-                loss = loss_dict['loss']
-            loss /= args.update_freq
+        loss_dict, acc_dict, loss = {}, {}, 0 
+        loss_dict_per_key, acc_dict_per_key = {}, {}   
+        for k in train_iter:
+            inputs = get_next_batch(train_iter[k], train_step[k], train_sampler[k])#next(iterator)
+            if args.model not in ['TRIPLET']:
+                inputs = [tensor.cuda(args.gpu, non_blocking=True) for tensor in inputs]
 
+            # compute output
+            with amp.autocast(enabled=not args.disable_amp):
+                if args.model=='TRIPLET':
+                    if args.toolkit=='bm':
+                        inputs = {k:tensor.cuda(args.gpu, non_blocking=True) for k,tensor in inputs.items()}
+                    loss_dict_per_key[k], features_dict, acc_dict_per_key[k] = model(
+                        mode=k,
+                        img=inputs.get('img',None),
+                        en=inputs['en'].squeeze(1), zh=inputs['zh'].squeeze(1))
+                    loss_dict = {**loss_dict, **loss_dict_per_key[k]}
+                    acc_dict = {**acc_dict, **acc_dict_per_key[k]}
+                    loss += loss_dict_per_key[k][f'{k}_total']
+                else:
+                    raise ValueError
+                    outputs = model(*inputs)
+                    loss_dict = criterion(outputs)
+                    loss = loss_dict['loss']
+                loss /= args.update_freq
+        if len(metrics)==0:
+            metrics = OrderedDict([(name, AverageMeter(name, ':.2e')) for name in list(loss_dict.keys())+list(acc_dict.keys())])
+            progress = ProgressMeter(
+                iters_per_epoch,
+                [batch_time, data_time, mem, *metrics.values()],
+                prefix="Epoch: [{}]".format(epoch))
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()))
             sys.exit(1)
@@ -395,10 +467,12 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
             utils.get_model(model).logit_scale.data.clamp_(0, 4.6052)
             logit_scale = utils.get_model(model).logit_scale.exp().item()
 
-        for k in loss_dict:
-            metrics[k].update(loss_dict[k].item(), args.batch_size)
-        for k in acc_dict:
-            metrics[k].update(acc_dict[k], args.batch_size)            
+        for mode, loss_dict_ in loss_dict_per_key.items():
+            for kk in loss_dict_:
+                metrics[kk].update(loss_dict_[kk].item(), args.mode2batch_size[mode])
+        for mode, acc_dict_ in acc_dict_per_key.items():
+            for kk in acc_dict_:
+                metrics[kk].update(acc_dict_[kk], args.mode2batch_size[mode])            
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -424,7 +498,8 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
                             val_stats['zh+en_logits_acc1'], 
                             val_stats['zh^en_logits_acc1'], 
                             val_stats['zh+en_probs_acc1'])
-                validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+                val_stats_re = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+                val_stats = {**val_stats, **val_stats_re}
             else:
                 val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
                 acc1 = val_stats['acc1']
@@ -447,8 +522,8 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
                         'epoch': epoch, 'step':data_iter}
 
             if utils.is_main_process():
-                # if args.wandb:
-                #     wandb.log(log_stats)
+                if args.wandb:
+                    wandb.log(log_stats)
                 with open(os.path.join(args.output_dir, 'log.txt'), 'a') as f:
                     f.write(json.dumps(log_stats) + '\n')
 
@@ -477,7 +552,7 @@ def validate_retrieval_bilingual_text(model, tokenizer, args):
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset, batch_size=128, shuffle=False, num_workers=args.workers, pin_memory=True, drop_last=False)          
             zh_embeddings_all, en_embeddings_all = [],[]
-            for batch in tqdm(val_dataloader, disable=(not is_main_process()):
+            for batch in tqdm(val_dataloader, disable=(not is_main_process())):
                 with torch.no_grad():
                     zh_embeddings, en_embeddings, bi_embeddings = \
                         utils.get_model(model).encode_text(
@@ -521,6 +596,7 @@ def validate_retrieval_bilingual_text(model, tokenizer, args):
 
 def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
     model.eval()
+    val_stats = {}
     DATASET2FILE = {
         'coco-cn': 'data/coco_cn/coco_cn_test.json', #{'img_id':{'zh':,'en':}}
         'aic':  '/data11/private/chenyutong/data/aic/aic_validation.json'
@@ -565,7 +641,7 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
 
         image_embeddings_all = []
         en_embeddings_all, zh_embeddings_all, bi_embeddings_all = [], [], []
-        for img, en, zh in tqdm(val_dataloader, disable=(not is_main_process()):
+        for img, en, zh in tqdm(val_dataloader, disable=(not is_main_process())):
             #B,k,L
             en, zh = en.reshape(-1,en.shape[-1]), zh.reshape(-1,zh.shape[-1])
             #en, zh = en.squeeze(1), zh.squeeze(1) #
@@ -602,6 +678,8 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
                 acc1.append(pred_topk[0] in capids)
                 acc5.append(np.max([cid in pred_topk for cid in capids]))
             acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
+            val_stats[f'{dataset}_I2T_acc1'] = acc1
+            val_stats[f'{dataset}_I2T_acc5'] = acc5
             print('{}({}) acc1={:.2f} acc5={:.2f}'.format('Image->Text', lang, acc1, acc5))
             #direction Text->Image
             acc1, acc5 = [], []
@@ -611,10 +689,13 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
                 acc1.append(pred_topk[0]==imgid)
                 acc5.append(imgid in pred_topk)    
             acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
+            val_stats[f'{dataset}_T2I_acc1'] = acc1
+            val_stats[f'{dataset}_T2I_acc5'] = acc5
             print('{}({}) acc1={:.2f} acc5={:.2f}'.format('Text->Image', lang, acc1, acc5))                                
     #dist.barrier()
     dist_synchronize()
     model.train()
+    return val_stats
 
 def validate_retrieval_bilingual_single(model, val_transform, tokenizer, args):
     model.eval()

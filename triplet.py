@@ -279,11 +279,11 @@ class Triplet(torch.nn.Module):
         zh_text_features, _, _ = self.model_zh.encode_text(zh) #B,D
         loss_dict = {}
         loss_dict['distillation'] = torch.nn.functional.mse_loss(zh_text_features, en_text_features, reduction='mean') 
-        loss_dict['total'] = loss_dict['distillation']
+        loss_dict['distill_total'] = loss_dict['distillation']
         return loss_dict
     
-    def forward(self, en=None, zh=None, img=None):
-        if self.only_distillation and img==None:
+    def forward(self, mode, en=None, zh=None, img=None):
+        if (self.only_distillation and img==None) or mode=='distill':
             return self.forward_only_distillation(en=en, zh=zh), {}, {}
         image_features = self.encode_image(img)
         image_features = self.normalize(image_features)
@@ -298,7 +298,7 @@ class Triplet(torch.nn.Module):
             if v is not None:   
                 features_dict[k] = v
 
-        loss_dict = {'total':0}
+        loss_dict = {'contrastive_total':0}
         acc_dict = {}
         if self.training and self.use_allgather:
             gathered_features_dict = {}
@@ -309,6 +309,7 @@ class Triplet(torch.nn.Module):
         
         for loss_key, loss_weight in self.loss_weight.items():
             if loss_key=='distillation':
+                continue  #compute separately
                 loss_dict[loss_key] = torch.nn.functional.mse_loss(zh_text_features, en_text_features, reduction='mean')                 
                 loss_dict['total'] += loss_weight*loss_dict[loss_key]
             elif '|' in loss_key:
@@ -326,7 +327,7 @@ class Triplet(torch.nn.Module):
                 logits = logit_scale*f0@f12.t()
                 loss, acc1, acc2 = criterion(logits)
                 loss_dict[loss_key] = loss
-                loss_dict['total'] += loss_weight*loss
+                loss_dict['contrastive_total'] += loss_weight*loss
                 acc_dict[f'{k0}->{k1}({k1}|{k2})'], acc_dict[f'{k0}->{k2}({k1}|{k2})'], acc_dict[f'{k0}->{k1}|{k2}'] = acc1, acc2, acc1+acc2
             else:
                 #one-one loss
@@ -357,7 +358,7 @@ class Triplet(torch.nn.Module):
                 logits = logit_scale*fs@gathered_ft.t()
                 loss, acc = criterion(logits)
                 loss_dict[loss_key] = loss
-                loss_dict['total'] += loss_weight*loss
+                loss_dict['contrastive_total'] += loss_weight*loss
                 acc_dict[loss_key] = acc       
         return loss_dict, features_dict, acc_dict
             

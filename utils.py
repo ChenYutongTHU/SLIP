@@ -424,7 +424,21 @@ def all_gather_batch_with_grad(tensors):
     return output_tensor
 
 
-def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epochs=0, start_warmup_value=0):
+def cosine_scheduler_step(base_value, final_value, steps, warmup_steps=0, start_warmup_value=0):
+    warmup_schedule = np.array([])
+    warmup_iters = warmup_steps
+    if warmup_iters > 0:
+        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
+
+    iters = np.arange(steps - warmup_iters)
+    schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
+
+    schedule = np.concatenate((warmup_schedule, schedule))
+    assert len(schedule) == steps , (len(schedule), steps)
+    return schedule
+
+
+def cosine_scheduler_epoch(base_value, final_value, epochs, niter_per_ep, warmup_epochs=0, start_warmup_value=0):
     warmup_schedule = np.array([])
     warmup_iters = warmup_epochs * niter_per_ep
     if warmup_epochs > 0:

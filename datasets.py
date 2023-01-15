@@ -353,7 +353,7 @@ def get_downstream_dataset(catalog, name, is_train, transform):
     return dataset
 
 
-def get_dataset(train_transform, tokenizer, args):
+def get_dataset(train_transform, tokenizer, dataset_names, args, need_only_text=True, read_tsv=True):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
     augment = transforms.Compose([
@@ -375,19 +375,19 @@ def get_dataset(train_transform, tokenizer, args):
     elif args.model.startswith('SLIP'):
         return ImageCaptionDatasetSLIP(args.dataset, args.root, args.metadata, train_transform, augment, tokenizer)
     elif args.model.startswith('TRIPLET'):
-        need_img = (not args.need_only_text)
+        need_img = not need_only_text #(not args.need_only_text)
         catalog = json.load(open('dataset_catalog.json', 'r'))
-        if args.read_tsv:
+        if read_tsv:
             if need_img==False:
-                return BilingualDataset_from_TSV(names=args.dataset, catalog=catalog, tokenizer=tokenizer)
+                return BilingualDataset_from_TSV(names=dataset_names, catalog=catalog, tokenizer=tokenizer)
             else:
-                return TripletDataset(names=args.dataset, catalog=catalog,
+                return TripletDataset(names=dataset_names, catalog=catalog,
                         preprocess=train_transform, tokenizer=tokenizer,
                         need_img=True, txt_from_tsv=True)
         if args.toolkit_data=='torch':
-            return TripletDataset(names=args.dataset, catalog=catalog, preprocess=train_transform, 
+            return TripletDataset(names=dataset_names, catalog=catalog, preprocess=train_transform, 
                               tokenizer=tokenizer, need_img=need_img) # a dict
         elif args.toolkit_data=='bm' and need_img==False:
-            return TextDistillDataset(names=args.dataset, catalog=catalog)
+            return TextDistillDataset(names=dataset_names, catalog=catalog)
         else:
             raise ValueError
