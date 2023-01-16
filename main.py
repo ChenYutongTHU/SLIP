@@ -246,22 +246,24 @@ def main(args):
     # make sure num_samples = 0 mod num_gpus for exact acc
 
     if args.toolkit in 'torch': #toolkit! instead of toolkit_data (dist.get_rank())
-        train_loader, train_sampler, train_iter, train_step = {}, {}, {}, {}
+        dataset2iteration = {
+                'train_loader': {}, 'train_sampler': {},
+                'train_iter': {}, 'train_step':{}}
         longest_dataset = None
         args.mode2batch_size = {'distill':args.batch_size_distill, 'contrastive':args.batch_size_contrastive}
         for k, d in train_dataset.items():
             if args.distributed:
-                train_sampler[k] = torch.utils.data.distributed.DistributedSampler(d)
+                dataset2iteration['train_sampler'][k] = torch.utils.data.distributed.DistributedSampler(d)
             else:
-                train_sampler[k] = None
-            train_loader[k] = torch.utils.data.DataLoader(
-                d, batch_size=args.mode2batch_size[k], shuffle=(train_sampler[k] is None),
-                num_workers=args.workers, pin_memory=True, sampler=train_sampler[k], drop_last=True)
-            train_iter[k] = iter(train_loader[k])
-            train_step[k] = [0, len(train_loader[k]), 0] #current, total steps per epoch, cur_epoch
-            if longest_dataset==None or len(train_loader[k])>len(train_loader[longest_dataset]):
+                dataset2iteration['train_sampler'][k] = None
+            dataset2iteration['train_loader'][k] = torch.utils.data.DataLoader(
+                d, batch_size=args.mode2batch_size[k], shuffle=(dataset2iteration['train_sampler'][k] is None),
+                num_workers=args.workers, pin_memory=True, sampler=dataset2iteration['train_sampler'][k], drop_last=True)
+            dataset2iteration['train_iter'][k] = iter(dataset2iteration['train_loader'][k])
+            dataset2iteration['train_step'][k] = [0, len(dataset2iteration['train_loader'][k]), 0] #current, total steps per epoch, cur_epoch
+            if longest_dataset==None or len(dataset2iteration['train_loader'][k])>len(dataset2iteration['train_loader'][longest_dataset]):
                 longest_dataset = k
-            print(f'Dataset {k}, #={len(train_dataset[k])}, #batch={len(train_loader[k])}, sampler-len{len(train_sampler[k])}')
+            print(f'Dataset {k}, #={len(train_dataset[k])}, #batch={len(dataset2iteration["train_loader"][k])}, sampler-len{len(dataset2iteration["train_sampler"][k])}')
         if args.distributed:
             val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
         else:
@@ -297,7 +299,7 @@ def main(args):
 
     if args.training_unit=='epoch':
         lr_schedule = utils.cosine_scheduler_epoch(args.lr, args.lr_end, args.epochs,
-            len(train_loader[longest_dataset]) // args.update_freq, warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr_start)
+            len(dataset2iteration['train_loader'][longest_dataset]) // args.update_freq, warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr_start)
     elif args.training_unit=='step':
         lr_schedule = utils.cosine_scheduler_step(args.lr, args.lr_end, args.steps,
              warmup_steps=args.warmup_steps, start_warmup_value=args.lr_start)
@@ -319,16 +321,16 @@ def main(args):
         # print(val_stats)
     print("=> beginning training")
     if args.training_unit=='step':
-        args.epochs = math.ceil(args.steps/len(train_loader[longest_dataset]))
+        args.epochs = math.ceil(args.steps/len(dataset2iteration['train_loader'][longest_dataset]))
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed and args.toolkit=='torch':
-            train_sampler[longest_dataset].set_epoch(epoch)
+            dataset2iteration['train_sampler'][longest_dataset].set_epoch(epoch)
         # train for one epoch
         if args.training_unit=='step':
-            end_step = args.steps-epoch*len(train_loader[longest_dataset])
+            end_step = args.steps-epoch*len(dataset2iteration['train_loader'][longest_dataset])
         else:
-            end_step = len(train_loader[longest_dataset])
-        train_stats = train(train_iter, train_step, train_sampler,
+            end_step = len(dataset2iteration['train_loader'][longest_dataset])
+        train_stats = train(dataset2iteration,
             longest_dataset, model, criterion, optimizer, scaler, epoch, lr_schedule, args, 
             val_loader, tokenizer, val_transform, end_step)
 
@@ -368,7 +370,7 @@ def main(args):
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in val_stats.items()},
-                     'epoch': epoch, 'step':len(train_loader[longest_dataset])}
+                     'epoch': epoch, 'step':len(dataset2iteration['train_loader'][longest_dataset])}
 
         if utils.is_main_process():
             if args.wandb:
@@ -376,20 +378,31 @@ def main(args):
             with open(os.path.join(args.output_dir, 'log.txt'), 'a') as f:
                 f.write(json.dumps(log_stats) + '\n')
 
-def get_next_batch(train_iter_, train_step_, train_sampler_):
-    cur_step, step_per_epoch ,cur_epoch = train_step_
+def get_next_batch(dataset2iteration, k):
+    cur_step, step_per_epoch ,cur_epoch = dataset2iteration['train_step'][k]
     if cur_step>=step_per_epoch:
-        train_sampler_.set_epoch(cur_epoch+1)
-        train_step_[2] += 1
-    train_step_[0] += 1
-    return next(train_iter_)
+        dataset2iteration['train_sampler'][k].set_epoch(cur_epoch+1)
+        dataset2iteration['train_step'][k][2] += 1
+        dataset2iteration['train_iter'][k] = iter(dataset2iteration['train_loader'][k])
+        # print('Reset loader', k, dataset2iteration['train_step'][k][2])
+        dataset2iteration['train_step'][k][0] = 0 
+    dataset2iteration['train_step'][k][0] += 1
+    try:
+        data = next(dataset2iteration['train_iter'][k])
+    except:
+        dataset2iteration['train_sampler'][k].set_epoch(cur_epoch+1)
+        dataset2iteration['train_step'][k][2] += 1
+        dataset2iteration['train_iter'][k] = iter(dataset2iteration['train_loader'][k])    
+        dataset2iteration['train_step'][k][0] = 0 
+        # print('Reset loader', k, dataset2iteration['cur_epoch'])  
+    return data
 
-def train(train_iter, train_step, train_sampler, longest_dataset, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer, val_transform, end_step):
+def train(dataset2iteration, longest_dataset, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer, val_transform, end_step):
     batch_time = AverageMeter('Time', ':6.2f')
     data_time = AverageMeter('Data', ':6.2f')
     mem = AverageMeter('Mem (GB)', ':6.1f')
     metric_names = models.get_metric_names(args.model)
-    iters_per_epoch = len(train_iter[longest_dataset]) // args.update_freq
+    iters_per_epoch = len(dataset2iteration['train_iter'][longest_dataset]) // args.update_freq
     metrics = OrderedDict([(name, AverageMeter(name, ':.2e')) for name in metric_names])
     if len(metrics):
         progress = ProgressMeter(
@@ -402,7 +415,7 @@ def train(train_iter, train_step, train_sampler, longest_dataset, model, criteri
 
     end = time.time()
     #train_iter = {k:iter(loader) for k, loader in train_loader.items()}
-    for data_iter in range(len(train_iter[longest_dataset])):
+    for data_iter in range(len(dataset2iteration['train_iter'][longest_dataset])):
         #inputs
         optim_iter = data_iter // args.update_freq
         if optim_iter>=end_step:
@@ -417,8 +430,8 @@ def train(train_iter, train_step, train_sampler, longest_dataset, model, criteri
 
         loss_dict, acc_dict, loss = {}, {}, 0 
         loss_dict_per_key, acc_dict_per_key = {}, {}   
-        for k in train_iter:
-            inputs = get_next_batch(train_iter[k], train_step[k], train_sampler[k])#next(iterator)
+        for k in dataset2iteration['train_iter']:
+            inputs = get_next_batch(dataset2iteration,k)#next(iterator)
             if args.model not in ['TRIPLET']:
                 inputs = [tensor.cuda(args.gpu, non_blocking=True) for tensor in inputs]
 
