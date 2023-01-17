@@ -216,7 +216,7 @@ class TripletDataset(torch.utils.data.Dataset):
             image = img_from_base64(row[-1])
             if self.preprocess is not None:
                 image = self.preprocess(image)
-            return {'img':image, 'en':en, 'zh':zh}
+            return {'img':image, 'en':en, 'zh':zh, 'index': index}
         else:
             return {'en':en, 'zh':zh}
 
@@ -234,14 +234,14 @@ class BilingualDataset_from_list(torch.utils.data.Dataset):
         return {'en':en, 'zh':zh}
 
 class TripletDataset_from_rawfile(torch.utils.data.Dataset):
-    def __init__(self, img_file, zh, en, preprocess, tokenizer):
+    def __init__(self, img_file, zh, en, preprocess, tokenizer, return_dict=False):
         super().__init__()
         self.img_file = img_file
         self.zh, self.en = zh, en
         self.preprocess = preprocess
         self.tokenizer = tokenizer
         assert len(self.img_file)==len(self.zh) and len(self.zh)==len(self.en)
-    
+        self.return_dict = return_dict
     def __len__(self):
         return len(self.img_file)
     
@@ -256,8 +256,11 @@ class TripletDataset_from_rawfile(torch.utils.data.Dataset):
         image = self.preprocess(image)
 
         en = self.tokenizer['en'](self.en[index])
-        zh = self.tokenizer['zh'](self.zh[index])        
-        return image, en, zh
+        zh = self.tokenizer['zh'](self.zh[index])   
+        if self.return_dict:
+            return {'img':image, 'en':en, 'zh':zh, 'index': index}
+        else:    
+            return image, en, zh
 
 class ImageCaptionDatasetSLIP(ImageCaptionDatasetBase):
     def __init__(self, dataset, root, metadata, transform, augment, tokenizer=None):
