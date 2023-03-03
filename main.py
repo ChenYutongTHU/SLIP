@@ -36,6 +36,10 @@ from model_center.dataset import DistributedDataLoader
 
 def get_args_parser():
     parser = argparse.ArgumentParser(description='SLIP training and evaluation', add_help=False)
+    #add 
+    parser.add_argument('--distill_weight', type=float, default=1.0)
+    parser.add_argument('--contrastive_weight', type=float, default=1.0)
+    #
     parser.add_argument('--eval_freq', type=int, default=1)
     parser.add_argument('--eval_metric', default='zh_acc1')
     parser.add_argument('--save_per_step', type=int, default=10000)
@@ -69,6 +73,7 @@ def get_args_parser():
     # Training
     parser.add_argument('--training_unit', default='epoch')
     parser.add_argument('--steps', default=1000, type=int)
+    parser.add_argument('--force_stop_step', default=-1, type=int)
     parser.add_argument('--warmup-steps', default=100, type=int)
     parser.add_argument('--epochs', default=25, type=int)
     parser.add_argument('--warmup-epochs', default=1, type=int)
@@ -318,7 +323,7 @@ def main(args):
     #     val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
     #     print(val_stats)
     #     val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
-        # print(val_stats)
+    #     print(val_stats)
     print("=> beginning training")
     if args.training_unit=='step':
         args.epochs = math.ceil(args.steps/len(dataset2iteration['train_loader'][longest_dataset]))
@@ -330,6 +335,9 @@ def main(args):
             end_step = args.steps-epoch*len(dataset2iteration['train_loader'][longest_dataset])
         else:
             end_step = len(dataset2iteration['train_loader'][longest_dataset])
+        
+        if args.force_stop_step!=-1:
+            end_step = args.force_stop_step-epoch*len(dataset2iteration['train_loader'][longest_dataset])
         train_stats = train(dataset2iteration,
             longest_dataset, model, criterion, optimizer, scaler, epoch, lr_schedule, args, 
             val_loader, tokenizer, val_transform, end_step)
@@ -446,7 +454,13 @@ def train(dataset2iteration, longest_dataset, model, criterion, optimizer, scale
                         en=inputs['en'].squeeze(1), zh=inputs['zh'].squeeze(1))
                     loss_dict = {**loss_dict, **loss_dict_per_key[k]}
                     acc_dict = {**acc_dict, **acc_dict_per_key[k]}
-                    loss += loss_dict_per_key[k][f'{k}_total']
+                    if k=='distill':
+                        weight = args.distill_weight
+                    elif k=='contrastive':
+                        weight = args.contrastive_weight
+                    else:
+                        raise ValueError
+                    loss += loss_dict_per_key[k][f'{k}_total_loss']*weight
                 else:
                     raise ValueError
                     outputs = model(*inputs)
@@ -612,11 +626,11 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
     val_stats = {}
     DATASET2FILE = {
         'coco-cn': 'data/coco_cn/coco_cn_test.json', #{'img_id':{'zh':,'en':}}
-        'aic':  '/data11/private/chenyutong/data/aic/aic_validation.json'
+        'aic':  'data/aic/aic_validation.json'
     }
     DATASET2IMG = {
         'coco-cn': 'data/coco_cn/coco_cn_test_images/{}.jpg', #.format(img_id)
-        'aic': '/data11/private/chenyutong/data/aic/caption_validation_images_20170910/{}.jpg'
+        'aic': 'data/aic/caption_validation_images_20170910/{}.jpg'
     }
     for dataset in ['coco-cn','aic']:
         print(f'Evaluate Img<->Text Retrieval on {dataset} ...')
@@ -691,8 +705,8 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
                 acc1.append(pred_topk[0] in capids)
                 acc5.append(np.max([cid in pred_topk for cid in capids]))
             acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
-            val_stats[f'{dataset}_I2T_acc1'] = acc1
-            val_stats[f'{dataset}_I2T_acc5'] = acc5
+            val_stats[f'{dataset}_I2T_acc1_{lang}'] = round(acc1,2)
+            val_stats[f'{dataset}_I2T_acc5_{lang}'] = round(acc5,2)
             print('{}({}) acc1={:.2f} acc5={:.2f}'.format('Image->Text', lang, acc1, acc5))
             #direction Text->Image
             acc1, acc5 = [], []
@@ -702,8 +716,8 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
                 acc1.append(pred_topk[0]==imgid)
                 acc5.append(imgid in pred_topk)    
             acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
-            val_stats[f'{dataset}_T2I_acc1'] = acc1
-            val_stats[f'{dataset}_T2I_acc5'] = acc5
+            val_stats[f'{dataset}_T2I_acc1_{lang}'] = round(acc1,2)
+            val_stats[f'{dataset}_T2I_acc5_{lang}'] = round(acc5,2)
             print('{}({}) acc1={:.2f} acc5={:.2f}'.format('Text->Image', lang, acc1, acc5))                                
     #dist.barrier()
     dist_synchronize()
@@ -934,7 +948,7 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
         top1_, top5_ = top1[k], top5[k]
         print(k+': 0-shot * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
             .format(top1=top1_, top5=top5_))
-        return_dict[f'{k}_acc1'], return_dict[f'{k}_acc5'] = top1_.avg, top5_.avg
+        return_dict[f'{k}_acc1'], return_dict[f'{k}_acc5'] = round(top1_.avg,2), round(top5_.avg,2)
     return return_dict
 
 def validate_zeroshot(val_loader, model, tokenizer, args):

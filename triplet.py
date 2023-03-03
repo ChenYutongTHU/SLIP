@@ -165,6 +165,8 @@ class Triplet(torch.nn.Module):
             freeze_params(self.model_zh) #text encoder (zh)
             freeze_params(self.model_en) #text encoder (en)
             freeze_params(self.visual) #visual encoder
+            if 'visual' in cfg['trainable_modules']:            
+                unfreeze_params(self.visual)
             if 'zh_text_encoder' in cfg['trainable_modules']:
                 if self.model_zh_type=='mengzi':
                     unfreeze_params(self.model_zh)
@@ -188,10 +190,10 @@ class Triplet(torch.nn.Module):
                 self.visual_proj.requires_grad = False
             if 'logit_scale' not in cfg['trainable_modules']:
                 self.logit_scale.requires_grad = False
-            print('Freeze some parameters; Trainable params:')
-            for n, p in self.named_parameters():
-                if p.requires_grad==True:
-                    print(n)
+            # print('Freeze some parameters; Trainable params:')
+            # for n, p in self.named_parameters():
+            #     if p.requires_grad==True:
+            #         print(n)
         if cfg.get('reinitialize_modules', [])!=[]:
             if 'zh_text_projection' in cfg['reinitialize_modules']:
                 if self.model_zh_type == 'wukong':
@@ -278,8 +280,9 @@ class Triplet(torch.nn.Module):
             en_text_features, _, _ = self.model_en.encode_text(en) #B,D
         zh_text_features, _, _ = self.model_zh.encode_text(zh) #B,D
         loss_dict = {}
-        loss_dict['distillation'] = torch.nn.functional.mse_loss(zh_text_features, en_text_features, reduction='mean') 
-        loss_dict['distill_total'] = loss_dict['distillation']
+        loss_dict['distillation_loss'] = torch.nn.functional.mse_loss(zh_text_features, en_text_features, reduction='mean') 
+        loss_dict['distillation_loss'] *= self.loss_weight['distillation']
+        loss_dict['distill_total_loss'] = loss_dict['distillation_loss']
         return loss_dict
     
     def forward(self, mode, en=None, zh=None, img=None):
@@ -298,7 +301,7 @@ class Triplet(torch.nn.Module):
             if v is not None:   
                 features_dict[k] = v
 
-        loss_dict = {'contrastive_total':0}
+        loss_dict = {'contrastive_total_loss':0}
         acc_dict = {}
         if self.training and self.use_allgather:
             gathered_features_dict = {}
@@ -326,9 +329,9 @@ class Triplet(torch.nn.Module):
                     f12 = f12.detach()
                 logits = logit_scale*f0@f12.t()
                 loss, acc1, acc2 = criterion(logits)
-                loss_dict[loss_key] = loss
-                loss_dict['contrastive_total'] += loss_weight*loss
-                acc_dict[f'{k0}->{k1}({k1}|{k2})'], acc_dict[f'{k0}->{k2}({k1}|{k2})'], acc_dict[f'{k0}->{k1}|{k2}'] = acc1, acc2, acc1+acc2
+                loss_dict[loss_key+'_loss'] = loss
+                loss_dict['contrastive_total_loss'] += loss_weight*loss
+                acc_dict[f'{k0}->{k1}({k1}|{k2})_acc'], acc_dict[f'{k0}->{k2}({k1}|{k2})_acc'], acc_dict[f'{k0}->{k1}|{k2}_acc'] = acc1, acc2, acc1+acc2
             else:
                 #one-one loss
                 criterion = ClipInfoCELoss_unidirectional()
@@ -357,9 +360,9 @@ class Triplet(torch.nn.Module):
                     gathered_ft = gathered_ft.detach()
                 logits = logit_scale*fs@gathered_ft.t()
                 loss, acc = criterion(logits)
-                loss_dict[loss_key] = loss
-                loss_dict['contrastive_total'] += loss_weight*loss
-                acc_dict[loss_key] = acc       
+                loss_dict[loss_key+'_loss'] = loss
+                loss_dict['contrastive_total_loss'] += loss_weight*loss
+                acc_dict[loss_key+'_acc'] = acc       
         return loss_dict, features_dict, acc_dict
             
         

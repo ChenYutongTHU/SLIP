@@ -209,8 +209,9 @@ class TripletDataset(torch.utils.data.Dataset):
             en, zh = self.name2tsv_txt[name].seek(index)
         else:
             img_name, id, en, zh = self.name2triplets[name][index]
-        en = self.tokenizer['en'](en)
-        zh = self.tokenizer['zh'](zh)
+        if self.tokenizer is not None:
+            en = self.tokenizer['en'](en)
+            zh = self.tokenizer['zh'](zh)
         if self.need_img:
             row = self.name2tsv[name].seek(id)
             image = img_from_base64(row[-1])
