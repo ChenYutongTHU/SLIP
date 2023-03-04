@@ -6,13 +6,29 @@ import torchvision.transforms as transforms
 import utils, models, datasets
 from utils import get_rank, get_world_size, is_main_process, dist_synchronize, dist_all_reduce
 from datasets import TripletDataset
-
+import numpy as np
+def reorder(sim, num_replicas, num):
+    sim_reordered = {}
+    for la in sim:
+        assert sim[la].shape[0]%num_replicas==0, (sim[la].shape)
+        total_size = sim[la].shape[0]
+        chunk_size = total_size//num_replicas 
+        ids = []
+        for rank in range(num_replicas):
+            ids.append(np.arange(sim[la].shape[0])[rank:total_size:num_replicas])
+        ids = np.concatenate(ids, axis=0)
+        sim_reordered[la] = np.zeros_like(sim[la])
+        for i0,i1 in enumerate(ids):
+            sim_reordered[la][i1] = sim[la][i0]
+        sim_reordered[la] = sim_reordered[la][:num]
+    return sim_reordered
+    
 def get_args_parser():
     parser = argparse.ArgumentParser(description='Compute CLIP score', add_help=False)
     parser.add_argument('--model_cfg_path', default='experiments/configs_distill_contrastive/Vit_L_14_lit.yaml')
     parser.add_argument('--datasets', default='coco-cn-test,aic-val,cc3m')
     parser.add_argument('--output_dir', default='dataset_analysis/')
-    parser.add_argument('--batch_size', default=128)
+    parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--load_ckpt', default='')
     parser.add_argument('--toolkit', default='torch')
     parser.add_argument('--model', default='TRIPLET')
@@ -50,7 +66,7 @@ def get_dataloader(args, val_transform, tokenizer):
                 img_file=img_files, zh=zh_caps, en=en_caps, 
                 preprocess=val_transform, tokenizer=tokenizer,
                 return_dict=True)
-        elif datasetname in ['cc3m']:
+        elif datasetname in ['cc3m','cc12m','coco']:
             dataset = TripletDataset(names=datasetname, catalog=catalog,
                         preprocess=val_transform, tokenizer=tokenizer,
                         need_img=True, txt_from_tsv=True)
@@ -89,6 +105,7 @@ def main(args):
     name2loader = get_dataloader(args, val_transform, tokenizer)
     for name, loader in name2loader.items():
         # ind2sim_en, ind2sim_zh = {}, {}
+        print(name,f'#dataset={len(loader.dataset)}, #loader={len(loader)}' )
         cosine_sim = {'zh':[], 'en':[]}
         for batch in tqdm(loader, disable=(not is_main_process())):
             img, zh, en = batch['img'], batch['zh'], batch['en']
@@ -105,6 +122,8 @@ def main(args):
                 cosine_sim[lang].append(torch.bmm(image_features.unsqueeze(1), text_embeddings[lang].unsqueeze(2)))
                 # print(len(indices), cosine_sim[lang][-1].shape)
                 # input()
+            # if len(cosine_sim['zh'])>=100:
+            #     break
         for lang in ['zh','en']:
             cosine_sim[lang] = torch.cat(cosine_sim[lang], dim=0).view(-1)
             cosine_sim[lang] = utils.all_gather_tensor(cosine_sim[lang]).cpu()
@@ -114,10 +133,16 @@ def main(args):
         for lang in ['zh','en']:
             stats[lang] = {'mean': torch.mean(cosine_sim[lang]).item(), 'std':torch.std(cosine_sim[lang]).item()}
         print(stats)
-        with open(os.path.join(args.output_dir, f'{name}_eval_log.txt'), 'a') as f:
-            f.write(json.dumps(stats) + '\n')
-        with open(os.path.join(args.output_dir, f'{name}_sim.pkl'),'wb') as f:
-            pickle.dump(cosine_sim, f)
+        if is_main_process():
+            with open(os.path.join(args.output_dir, f'{name}_eval_log.txt'), 'a') as f:
+                f.write(json.dumps(stats) + '\n')
+            with open(os.path.join(args.output_dir, f'{name}_sim_shuffled.pkl'),'wb') as f:
+                pickle.dump(cosine_sim, f)
+            cosine_sim_reordered = reorder(sim=cosine_sim, 
+                                           num_replicas=int(os.environ["WORLD_SIZE"]), num=len(loader.dataset))
+            with open(os.path.join(args.output_dir, f'{name}_sim.pkl'),'wb') as f:
+                pickle.dump(cosine_sim_reordered, f)
+        dist_synchronize()
         # input()
         # stats = {'sim_en':{'mean':, 'std':},
         #          'sim_zh':{'mean':,'std':}}

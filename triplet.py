@@ -254,18 +254,18 @@ class Triplet(torch.nn.Module):
     def normalize(self, x, eps=0):
         return x/(x.norm(dim=-1, keepdim=True)+eps)
     
-    def encode_text(self, zh, en):
+    def encode_text(self, zh, en, output_attention=False):
         if zh is not None:
-            zh_text_features, zh_text_features_imme, zh_eot = self.model_zh.encode_text(zh, self.self_attn_layers)
+            zh_text_features, zh_text_features_imme, zh_eot, zh_attention = self.model_zh.encode_text(zh, self.self_attn_layers)
             zh_text_features = self.normalize(zh_text_features, eps=1e-10)
         else:
-            zh_text_features = None
+            zh_text_features, zh_attention = None, None
         
         if en is not None and self.use_en_text_encoder:
-            en_text_features, en_text_features_imme, en_eot = self.model_en.encode_text(en, self.self_attn_layers)
+            en_text_features, en_text_features_imme, en_eot, en_attention = self.model_en.encode_text(en, self.self_attn_layers)
             en_text_features = self.normalize(en_text_features, eps=1e-10)
         else:
-            en_text_features = None
+            en_text_features, en_attention = None, None
 
         if self.x_attn_encoder is not None:
             bi_text_features = self.x_attn_encoder(zh=zh_text_features_imme, en=en_text_features_imme,
@@ -273,7 +273,10 @@ class Triplet(torch.nn.Module):
             bi_text_features = self.normalize(bi_text_features)
         else:
             bi_text_features = None
-        return zh_text_features, en_text_features, bi_text_features
+        if output_attention:
+            return zh_text_features, en_text_features, bi_text_features, zh_attention, en_attention
+        else:
+            return zh_text_features, en_text_features, bi_text_features
 
     def forward_only_distillation(self, en, zh):
         with torch.no_grad():

@@ -433,7 +433,7 @@ class CLIP(nn.Module):
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        xs, _ = self.transformer(x)
+        xs, attention = self.transformer(x)
         x = xs[-1]
         x_1 = xs[n_layer_1]
         x = x.permute(1, 0, 2)  # LND -> NLD
@@ -448,7 +448,8 @@ class CLIP(nn.Module):
             x = x[torch.arange(x.shape[0]), eot_loc] @ self.text_projection
         else:
             x = x@self.text_projection
-        return x, x_1, eot_loc
+        
+        return x, x_1, eot_loc, attention 
 
     def forward(self, image, text):
         image_features = self.encode_image(image)
