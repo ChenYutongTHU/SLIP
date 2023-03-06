@@ -53,11 +53,12 @@ class Triplet(torch.nn.Module):
             self.model_zh_type = 'mengzi'
             output_dim = self.model_en.embed_dim
             self.model_zh, self.tokenize_zh = mengzi.load(model_path=cfg['Model_Zh'], device=device, output_dim=output_dim, context_length=32)
-        DEBUG=False
-        if DEBUG:
-            self.visual = deepcopy(self.model_zh.visual)
-        else:
+        
+        
+        if cfg.get('visual','load_en')=='load_en':
             self.visual = deepcopy(self.model_en.visual)
+        else:
+            self.visual = deepcopy(self.model_zh.visual)
         del self.visual.proj
         self.visual.proj = None
         

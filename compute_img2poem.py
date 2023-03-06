@@ -16,7 +16,7 @@ def main(args):
     sentence_embeddings = torch.load(args.sentence_embed_path,map_location='cpu')
     assert len(sentences)==len(sentence_embeddings), (len(sentences),len(sentence_embeddings))
     print('Load keywords ...')
-    sentence_keywords = pickle.load(open(args.sentence_path.split('.')[0]+'.keyword.json','rb'))
+    sentence_keywords = pickle.load(open('.'.join(args.sentence_embed_path.split('.')[:-1])+'.keyword.pkl','rb'))
     assert len(sentences)==len(sentence_keywords), (len(sentences),len(sentence_keywords))    
     print(f'#sentences={len(sentence_embeddings)}')
 
@@ -62,11 +62,14 @@ def main(args):
             for rank, i in enumerate(indices[:args.topk]):
                 rank += 1
                 f.writelines(f'Top {rank}:\n')
-                f.writelines(f'{i}:{sentences[i]}\n')
+                if type(sentences[i])==dict:
+                    f.writelines(f'{i}:{sentences[i]["content"]}\n')
+                else:
+                    f.writelines(f'{i}:{sentences[i]}\n')
                 f.writelines(f'score:{round(sims[i].item(),3)}\n')
                 f.writelines('\n\n')
-                keywords = sentence_keywords[i] #[]
-
+                keywords_per_subsent = sentence_keywords[i] #[] usually consists of two subsentences
+                
             f.writelines('==============Re-Ranking==============\n')
             # note that split to two subsentences
 
