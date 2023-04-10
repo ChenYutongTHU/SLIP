@@ -8,7 +8,7 @@
 from collections import OrderedDict
 
 import numpy as np
-import timm
+import timm, os
 import torch
 from torch import nn
 from utils import load_config
@@ -16,7 +16,9 @@ from triplet import Triplet
 from triplet_bm import Triplet_bm
 import bmtrain as bmt
 import losses
-
+from altclip import AltCLIP
+from taiyi import Taiyi
+from mclip import MClip
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
@@ -242,11 +244,11 @@ def get_loss(model, ssl_temp, ssl_scale):
     if model.startswith('SLIP'):
         ssl_loss = losses.SIMCLRLoss(temperature=ssl_temp)
         return losses.SLIPLoss(ssl_loss, ssl_scale)
-    if model.startswith('CLIP'):
+    elif model.startswith('CLIP'):
         return losses.CLIPLoss()
-    if model.startswith('SIMCLR'):
+    elif model.startswith('SIMCLR'):
         return losses.SIMCLRLoss(temperature=ssl_temp)
-    if model.startswith('TRIPLET'):
+    else:
         return None
 
 
@@ -337,7 +339,7 @@ def SLIP_VITL16(**kwargs):
 
     return model
 
-def TRIPLET(model_cfg_path, toolkit, **kwargs):
+def TRIPLET(model_cfg_path, toolkit='torch', **kwargs):
     cfg = load_config(model_cfg_path)
     if toolkit=='torch':
         model = Triplet(cfg, device='cpu')
@@ -345,4 +347,13 @@ def TRIPLET(model_cfg_path, toolkit, **kwargs):
         model = Triplet(cfg, device='cpu')
         model = bmt.BMTrainModelWrapper(model)
     return model
+
+def ALTCLIP(**kwargs):
+    return AltCLIP()
+
+def TAIYI(**kwargs):
+    return Taiyi()
+
+def MCLIP(**kwargs):
+    return MClip()
 

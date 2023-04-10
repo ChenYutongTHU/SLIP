@@ -8,6 +8,11 @@ class Mengzi_Encoder(torch.nn.Module):
         del self.mengzi.decoder
         del self.mengzi.lm_head
         self.text_projection = torch.nn.Linear(self.mengzi.config.d_model, output_dim)
+    
+    @property
+    def dtype(self):
+        return self.text_projection.weight.dtype
+    
 
     def encode_text(self, input_ids, attn_layer=-1):
         attention_mask = (input_ids!=0).long() #B,L
@@ -19,7 +24,7 @@ class Mengzi_Encoder(torch.nn.Module):
         last_hidden_states = encoder_outputs[0] #B,L,D
         eos_embed = last_hidden_states[torch.arange(0, input_ids.shape[0]),eos_pos] #B,D
         text_embed = self.text_projection(eos_embed) #B,D
-        return text_embed, None, None
+        return text_embed, None, None, None
 
 class Mengzi_Tokenizer(object):
     def __init__(self, model_path, max_length=32):

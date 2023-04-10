@@ -3,9 +3,9 @@ from tqdm import tqdm
 import torch
 import torch.backends.cudnn as cudnn
 import torchvision.transforms as transforms
-import utils, models, datasets
+import utils, models, Datasets
 from utils import get_rank, get_world_size, is_main_process, dist_synchronize, dist_all_reduce
-from datasets import TripletDataset
+from Datasets import TripletDataset
 import numpy as np
 def reorder(sim, num_replicas, num):
     sim_reordered = {}
@@ -62,7 +62,7 @@ def get_dataloader(args, val_transform, tokenizer):
                 zh_caps.extend(c['zh'])
                 en_caps.extend(c['en'])
                 img_files.extend([catalog[datasetname]['img_filename'].format(img_id)]*len(c['zh']))
-            dataset = datasets.TripletDataset_from_rawfile(
+            dataset = Datasets.TripletDataset_from_rawfile(
                 img_file=img_files, zh=zh_caps, en=en_caps, 
                 preprocess=val_transform, tokenizer=tokenizer,
                 return_dict=True)

@@ -1,10 +1,10 @@
 import argparse, os, json
 import torch, pickle
 import numpy as np
-import utils, models, datasets
+import utils, models, Datasets
 from tqdm import tqdm
-from PoemSegmentor.segmentor import Poem_Segmenter
-segmentor = Poem_Segmenter()
+# from PoemSegmentor.segmentor import Poem_Segmenter
+# segmentor = Poem_Segmenter()
 
 def segment_sentence(sentence):
     #xxxxx,xxxxx. -> [xxxxx,xxxxx]
@@ -89,11 +89,14 @@ def filter_keyword(segs, cluster_thresh=0.25, abs_thresh=6.8, rel_thresh=26.6):
                  'is_keyword':(cs*100>abs_thresh or ncs*100>rel_thresh)})
     return infos_word
 
-def build_and_load_model(model_cfg_path, model_path):
+def build_and_load_model(model_type, model_cfg_path, model_path):
     print('Building model')
-    model = getattr(models, 'TRIPLET')(
-        ssl_mlp_dim=4096, ssl_emb_dim=256,
-        model_cfg_path=model_cfg_path, toolkit='torch')
+    if model_type=='TRIPLET':
+        model = getattr(models, 'TRIPLET')(
+            ssl_mlp_dim=4096, ssl_emb_dim=256,
+            model_cfg_path=model_cfg_path, toolkit='torch')
+    else:
+        model = getattr(models, model_type)()
     if model_path!='':
         print('Load model from {}'.format(model_path))
         state_dict = torch.load(model_path, map_location='cpu')['state_dict']
@@ -114,10 +117,13 @@ class Sentence_dataset(torch.utils.data.Dataset):
     
 
 def main(args):
-    model = build_and_load_model(args.model_cfg_path, args.model_path)
+    model = build_and_load_model(args.model, args.model_cfg_path, args.model_path)
     model.cuda(args.gpu)
     # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], bucket_cap_mb=200)
-    tokenizer = {'en':utils.get_model(model).tokenize_en, 'zh':utils.get_model(model).tokenize_zh}
+    if args.model=='TRIPLET':
+        tokenizer = {'en':utils.get_model(model).tokenize_en, 'zh':utils.get_model(model).tokenize_zh}
+    else:
+        tokenizer = {'en':utils.get_model(model).tokenizer, 'zh':utils.get_model(model).tokenizer}
 
     print('Building sentence loader (only support single GPU)')
     sentences = json.load(open(args.sentence_path, 'r')) #list
@@ -131,11 +137,18 @@ def main(args):
     #     sentences = sentences[:4]
     #further split
     sentences_sub = []
-    sub2id = []
+    sub2id, id2sub = [],[[] for s in sentences]
     for si,sent in enumerate(sentences):
         sent_sub = segment_sentence(sent)
         sentences_sub.extend([s for _,_,s in sent_sub])
-        sub2id.extend([si]*len(sent_sub))
+        for ssi in range(len(sent_sub)):
+            id2sub[si].append(len(sub2id))
+            sub2id.append(si)
+    with open(args.sentence_path.replace('.json','.sub2id.json'), 'w') as f:
+        json.dump(sub2id, f)
+    with open(args.sentence_path.replace('.json','.id2sub.json'), 'w') as f:
+        json.dump(id2sub, f)
+    print('Save .sub2id.json')
 
     print(f'#sentences={len(sentences)}')
     dataset = Sentence_dataset(sentences, tokenizer['zh'])
@@ -149,16 +162,30 @@ def main(args):
         print('Computing embeddings ...')
         result_embeddings = []
         for zh in tqdm(dataloader, total=len(dataloader)):
-            if zh.dim()==3:
-                zh = zh.squeeze(1)
-            with torch.no_grad():
-                zh_embeddings, _, _, layer_attn_weights, _ = \
-                    utils.get_model(model).encode_text(zh=zh.cuda(), en=None, output_attention=True) #already normalize #B,N 
+            if args.model=='TRIPLET':
+                if zh.dim()==3:
+                    zh = zh.squeeze(1)
+                with torch.no_grad():
+                    zh_embeddings, _, _, layer_attn_weights, _ = \
+                        utils.get_model(model).encode_text(zh=zh.cuda(), en=None, output_attention=True) #already normalize #B,N 
+            else:
+                with torch.no_grad():
+                    if zh['input_ids'].dim()==3:
+                        zh['input_ids'] = zh['input_ids'].squeeze(1)
+                    if zh['attention_mask'].dim()==3:
+                        zh['attention_mask'] = zh['attention_mask'].squeeze(1)                                                    
+                    zh_embeddings, _,  = \
+                        utils.get_model(model).encode_text(
+                        zh_input_ids=zh['input_ids'].cuda(), 
+                        zh_attention_mask=zh['attention_mask'].cuda(),
+                        en_input_ids=None, en_attention_mask=None) #already normalize #B,                
             result_embeddings.extend([e.cpu() for e in zh_embeddings])  
 
         print('Saving embedding as {}'.format(args.output_path))
         torch.save(result_embeddings, args.output_path)
     
+    if args.model in ['ALTCLIP','TAIYI','MCLIP']:
+        return 
     print('Compute keywords ... ')
     id2keywords, id2attention = [[] for _ in range(len(dataset))], [[] for _ in range(len(dataset))]
     cnt = 0
@@ -186,9 +213,10 @@ def main(args):
                 id2keywords[sub2id[cnt]].extend(keywords) 
                 id2attention[sub2id[cnt]].append(word_attn)
             cnt += 1
+            # print(id2attention[0], sub2id[0])
+            # import ipdb; ipdb.set_trace()
             # if decoded==[]:
             #     print(input_ids_, sentences[len(extracted_keywords)])
-            #     import ipdb; ipdb.set_trace()
             # print(decoded)
             # print(keywords)
             # input() 
@@ -207,8 +235,9 @@ def main(args):
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description='compute sentence embeddings', add_help=False)
+    parser.add_argument('--model', default='TRIPLET')
     parser.add_argument('--model_cfg_path', default='experiments/configs_duet/zh_large_tune_all.yaml')
-    parser.add_argument('--model_path', default='experiments/outputs_duet/cc3m_gpu8_bs16_duet_tune_all_lr1e-6_wd0.001_warmup50_steps250/checkpoint_best.pt') 
+    parser.add_argument('--model_path', default='') 
     parser.add_argument('--sentence_path', required=True) 
     parser.add_argument('--output_path', required=True)
     parser.add_argument('--batch_size', default=512)

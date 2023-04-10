@@ -25,7 +25,7 @@ import torch.utils.data.distributed
 from torchvision.datasets import ImageFolder
 import torchvision.transforms as transforms
 from imagenetv2_pytorch import ImageNetValDataset
-import datasets
+import Datasets
 import models
 from tokenizer import SimpleTokenizer
 import utils
@@ -132,9 +132,13 @@ def main(args):
 
     # create model
     print("=> creating model: {}".format(args.model))
-    model = getattr(models, args.model)(
-        ssl_mlp_dim=args.ssl_mlp_dim, ssl_emb_dim=args.ssl_emb_dim,
-        model_cfg_path=args.model_cfg_path, toolkit=args.toolkit)
+    if args.model.upper()=='ALTCLIP':
+        model = getattr(models, args.model)()
+        assert args.evaluate==True
+    else:
+        model = getattr(models, args.model)(
+            ssl_mlp_dim=args.ssl_mlp_dim, ssl_emb_dim=args.ssl_emb_dim,
+            model_cfg_path=args.model_cfg_path, toolkit=args.toolkit)
     model.cuda(args.gpu)
     if args.toolkit=='bm':
         assert args.toolkit_data=='bm'
@@ -200,10 +204,14 @@ def main(args):
     print("=> creating dataset")
     if args.model.startswith('TRIPLET'):
         tokenizer = {'en':utils.get_model(model).tokenize_en, 'zh':utils.get_model(model).tokenize_zh}
+        #train_transform, val_transform = utils.get_model(model).preprocess, utils.get_model(model).preprocess
     else:
-        tokenizer = SimpleTokenizer()
+        if args.model == 'ALTCLIP':
+            tokenizer = {'en':utils.get_model(model).tokenizer, 'zh':utils.get_model(model).tokenizer}
+        else:
+            tokenizer = SimpleTokenizer()
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+                                    std=[0.229, 0.224, 0.225])
     train_transform = transforms.Compose([
             transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
             transforms.ToTensor(),
@@ -228,11 +236,11 @@ def main(args):
         args.training_mode = args.training_mode.split(',')
     for k in args.training_mode:
         if k=='distill':
-            train_dataset[k] = datasets.get_dataset(
+            train_dataset[k] = Datasets.get_dataset(
                     train_transform, tokenizer, args.dataset_distill, 
                     args=args, need_only_text=True, read_tsv=True)
         elif k=='contrastive':
-            train_dataset[k] = datasets.get_dataset(
+            train_dataset[k] = Datasets.get_dataset(
                     train_transform, tokenizer, args.dataset_contrastive, 
                     args=args, need_only_text=False, read_tsv=True)
         else:
@@ -288,7 +296,7 @@ def main(args):
         if args.model.startswith('SIMCLR'):
             print('zero-shot evaluation not supported with ssl-only model.')
             return
-        elif args.model in ['TRIPLET'] :
+        elif args.model in ['TRIPLET','ALTCLIP'] :
             if args.evaluate_retrieval:
                 zero_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
             elif args.evaluate_text_retrieval:
@@ -574,7 +582,7 @@ def validate_retrieval_bilingual_text(model, tokenizer, args):
             for _, c in id2texts.items():
                 zh_texts.append(c['zh'])
                 en_texts.append(c['en'])    
-            val_dataset = datasets.BilingualDataset_from_list(
+            val_dataset = Datasets.BilingualDataset_from_list(
                 zh=zh_texts, en=en_texts, tokenizer=tokenizer)
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset, batch_size=128, shuffle=False, num_workers=args.workers, pin_memory=True, drop_last=False)          
@@ -626,13 +634,15 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
     val_stats = {}
     DATASET2FILE = {
         'coco-cn': 'data/coco_cn/coco_cn_test.json', #{'img_id':{'zh':,'en':}}
-        'aic':  'data/aic/aic_validation.json'
+        'aic':  'data/aic/aic_validation.json',
+        'coco': '/data11/private/chenyutong/data/coco/val_karpathy.json',
     }
     DATASET2IMG = {
         'coco-cn': 'data/coco_cn/coco_cn_test_images/{}.jpg', #.format(img_id)
-        'aic': 'data/aic/caption_validation_images_20170910/{}.jpg'
+        'aic': 'data/aic/caption_validation_images_20170910/{}.jpg',
+        'coco': '/data11/private/chenyutong/data/coco/images/val_karpathy/{}.jpg',
     }
-    for dataset in ['coco-cn','aic']:
+    for dataset in ['coco-cn', 'aic']:#,'aic']:
         print(f'Evaluate Img<->Text Retrieval on {dataset} ...')
         with open(DATASET2FILE[dataset],'r') as f:
             img2captions = json.load(f)
@@ -641,6 +651,7 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
         img_files = []
         imgid2capid, capid2imgid = [], []
         for img_id, c in img2captions.items():
+            c['zh'], c['en'] = c['zh'][:5], c['en'][:5] ##a dirty solution, only use the first 5 sentences
             capid2imgid.extend([len(img_ids)]*len(c['zh']))
             img_ids.append(img_id)
             img_files.append(DATASET2IMG[dataset].format(img_id))
@@ -650,7 +661,7 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
             pt += len(c['zh'])
             assert len(c['zh'])==len(c['en'])
             zh_caps.append(c['zh'])
-            en_caps.append(c['en'])
+            en_caps.append(c['en']) 
         print('#Images={}, #Captions={}'.format(len(img_files), pt))
         #manually split
         chunk_size = math.ceil(len(img_files)/get_world_size())
@@ -660,7 +671,8 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
             img_files_ +=[img_files[-1] for _ in range(right-left, chunk_size)]
             zh_caps_ +=[zh_caps[-1] for _ in range(right-left, chunk_size)]
             en_caps_ +=[en_caps[-1] for _ in range(right-left, chunk_size)]
-        val_dataset = datasets.TripletDataset_from_rawfile(
+        #import ipdb; ipdb.set_trace()
+        val_dataset = Datasets.TripletDataset_from_rawfile(
             img_file=img_files_, zh=zh_caps_, en=en_caps_, preprocess=val_transform, tokenizer=tokenizer)
         val_dataloader = torch.utils.data.DataLoader(
             val_dataset, batch_size=128, shuffle=False,
@@ -670,12 +682,28 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
         en_embeddings_all, zh_embeddings_all, bi_embeddings_all = [], [], []
         for img, en, zh in tqdm(val_dataloader, disable=(not is_main_process())):
             #B,k,L
-            en, zh = en.reshape(-1,en.shape[-1]), zh.reshape(-1,zh.shape[-1])
             #en, zh = en.squeeze(1), zh.squeeze(1) #
             with torch.no_grad():
                 image_features = utils.get_model(model).encode_image(img.cuda())
-                zh_embeddings, en_embeddings, bi_embeddings = \
-                    utils.get_model(model).encode_text(zh=zh.cuda(), en=en.cuda()) #already normalize
+                if args.model == 'TRIPLET':
+                    en, zh = en.reshape(-1,en.shape[-1]), zh.reshape(-1,zh.shape[-1])
+                    zh_embeddings, en_embeddings, bi_embeddings = \
+                        utils.get_model(model).encode_text(zh=zh.cuda(), en=en.cuda()) #already normalize
+                else:
+                    zh_embeddings, en_embeddings, bi_embeddings = [], [], None
+                    batch_size = 16
+                    n_batch = math.ceil(len(zh['input_ids'])/batch_size)
+                    for i in range(n_batch):
+                        s, t = i*batch_size, min((i+1)*batch_size, len(zh['input_ids']))
+                        zh_emb, en_emb = utils.get_model(model).encode_text(
+                                zh_input_ids=zh['input_ids'][s:t,0].cuda(args.gpu, non_blocking=True), 
+                                en_input_ids=en['input_ids'][s:t,0].cuda(args.gpu, non_blocking=True), 
+                                zh_attention_mask=zh['attention_mask'][s:t,0].cuda(args.gpu, non_blocking=True), 
+                                en_attention_mask=en['attention_mask'][s:t,0].cuda(args.gpu, non_blocking=True))
+                        zh_embeddings.append(zh_emb)
+                        en_embeddings.append(en_emb)
+                    zh_embeddings = torch.cat(zh_embeddings, dim=0)
+                    en_embeddings = torch.cat(en_embeddings, dim=0)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             image_embeddings_all.append(image_features)
             en_embeddings_all.append(en_embeddings)
@@ -755,7 +783,7 @@ def validate_retrieval_bilingual_single(model, val_transform, tokenizer, args):
                 zh_caps.append(c['zh'])
                 en_caps.append(c['en'])
             print('#Images={}, #Captions={}'.format(len(img_files), pt))
-            val_dataset = datasets.TripletDataset_from_rawfile(
+            val_dataset = Datasets.TripletDataset_from_rawfile(
                 img_file=img_files, zh=zh_caps, en=en_caps, preprocess=val_transform, tokenizer=tokenizer)
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset, batch_size=128, shuffle=False,
@@ -836,10 +864,29 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
                     id2lang_text[id] = {}
                 id2lang_text[id][lang] = tokenizer[lang](texts)
         print('=> encoding captions')
-        for id in sorted(labels):
-            zh_embeddings, en_embeddings, bi_embeddings = utils.get_model(model).encode_text(
-                    zh=id2lang_text[id]['zh'].cuda(args.gpu, non_blocking=True), 
-                    en=id2lang_text[id]['en'].cuda(args.gpu, non_blocking=True)) 
+        for id in tqdm(sorted(labels)):
+            if args.model == 'TRIPLET':
+                zh_embeddings, en_embeddings, bi_embeddings = utils.get_model(model).encode_text(
+                        zh=id2lang_text[id]['zh'].cuda(args.gpu, non_blocking=True), 
+                        en=id2lang_text[id]['en'].cuda(args.gpu, non_blocking=True)) 
+            elif args.model == 'ALTCLIP':
+                # OOM
+                zh_embeddings, en_embeddings = [], []
+                batch_size = 16
+                n_batch = math.ceil(len(id2lang_text[id]['zh']['input_ids'])/batch_size)
+                for i in range(n_batch):
+                    s, t = i*batch_size, min((i+1)*batch_size, len(id2lang_text[id]['zh']['input_ids']))
+                    zh_emb, en_emb = utils.get_model(model).encode_text(
+                            zh_input_ids=id2lang_text[id]['zh']['input_ids'][s:t].cuda(args.gpu, non_blocking=True), 
+                            en_input_ids=id2lang_text[id]['en']['input_ids'][s:t].cuda(args.gpu, non_blocking=True), 
+                            zh_attention_mask=id2lang_text[id]['zh']['attention_mask'][s:t].cuda(args.gpu, non_blocking=True), 
+                            en_attention_mask=id2lang_text[id]['en']['attention_mask'][s:t].cuda(args.gpu, non_blocking=True))
+                    zh_embeddings.append(zh_emb)
+                    en_embeddings.append(en_emb)
+                zh_embeddings = torch.cat(zh_embeddings, dim=0)
+                en_embeddings = torch.cat(en_embeddings, dim=0)
+            else:
+                raise ValueError
             for k,v in [['zh', zh_embeddings],['en', en_embeddings]]:
                 if v is not None:
                     v = v.mean(dim=0)

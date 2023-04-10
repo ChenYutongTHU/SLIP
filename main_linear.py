@@ -22,7 +22,7 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
 from visual_cls import Vit_cls
-import datasets
+import Datasets
 import utils
 
 
@@ -199,8 +199,8 @@ def main(args):
         normalize,
     ])
 
-    train_dataset = datasets.get_downstream_dataset(catalog, args.dataset, is_train=True, transform=train_transform)
-    val_dataset = datasets.get_downstream_dataset(catalog, args.dataset, is_train=False, transform=val_transform)
+    train_dataset = Datasets.get_downstream_dataset(catalog, args.dataset, is_train=True, transform=train_transform)
+    val_dataset = Datasets.get_downstream_dataset(catalog, args.dataset, is_train=False, transform=val_transform)
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)

@@ -46,26 +46,41 @@ class Triplet(torch.nn.Module):
         self.use_allgather = cfg['use_allgather']
         self.model_en, self.preprocess = clip.load(cfg['Model_En'], device=device)
         self.tokenize_en = clip.tokenize
-        if 'wukong' in cfg['Model_Zh'].lower():
-            self.model_zh_type = 'wukong'
-            self.model_zh, self.tokenize_zh = wukong.load(pkl_path=cfg['Model_Zh'],device=device,lang='zh',context_length=32)
-        elif 'mengzi' in cfg['Model_Zh'].lower():
-            self.model_zh_type = 'mengzi'
-            output_dim = self.model_en.embed_dim
-            self.model_zh, self.tokenize_zh = mengzi.load(model_path=cfg['Model_Zh'], device=device, output_dim=output_dim, context_length=32)
         
-        
+        self.both_en = cfg.get('both_en',None) #'different_rand')
+        if self.both_en==None:
+            if 'wukong' in cfg['Model_Zh'].lower():
+                self.model_zh_type = 'wukong'
+                self.model_zh, self.tokenize_zh = wukong.load(pkl_path=cfg['Model_Zh'],device=device,lang='zh',context_length=32)
+            elif 'mengzi' in cfg['Model_Zh'].lower():
+                self.model_zh_type = 'mengzi'
+                output_dim = self.model_en.embed_dim
+                self.model_zh, self.tokenize_zh = mengzi.load(model_path=cfg['Model_Zh'], device=device, output_dim=output_dim, context_length=32)
+                #import ipdb; ipdb.set_trace()
+                # print(self.model_zh.dtype)
+        else:
+            if self.both_en=='different_rand':
+                self.model_zh_type = 'wukong'
+                self.model_zh = deepcopy(self.model_en)
+                self.tokenize_zh = self.tokenize_en
+            elif self.both_en=='different_architecture':
+                pass
+            else:
+                raise ValueError
+
         if cfg.get('visual','load_en')=='load_en':
             self.visual = deepcopy(self.model_en.visual)
         else:
             self.visual = deepcopy(self.model_zh.visual)
         del self.visual.proj
         self.visual.proj = None
+
         
         if cfg.get('from_scratch', False):
             print('Reinitialize model')
             self.model_zh.initialize_parameters()
             self.model_en.initialize_parameters() 
+            #import ipdb; ipdb.set_trace() 
 
         if cfg['visual_proj'] == 'scratch':
             width = self.visual.conv1.out_channels
@@ -256,12 +271,18 @@ class Triplet(torch.nn.Module):
         return x/(x.norm(dim=-1, keepdim=True)+eps)
     
     def encode_text(self, zh, en, output_attention=False):
-        if zh is not None:
-            zh_text_features, zh_text_features_imme, zh_eot, zh_attention = self.model_zh.encode_text(zh, self.self_attn_layers)
-            zh_text_features = self.normalize(zh_text_features, eps=1e-10)
+        if self.both_en==None:
+            if zh is not None:
+                zh_text_features, zh_text_features_imme, zh_eot, zh_attention = self.model_zh.encode_text(zh, self.self_attn_layers)
+                zh_text_features = self.normalize(zh_text_features, eps=1e-10)
+            else:
+                zh_text_features, zh_attention = None, None
         else:
-            zh_text_features, zh_attention = None, None
-        
+            assert en is not None, en #encode en!!
+            zh_text_features, zh_text_features_imme, zh_eot, zh_attention = self.model_zh.encode_text(en, self.self_attn_layers)
+            zh_text_features = self.normalize(zh_text_features, eps=1e-10)
+
+
         if en is not None and self.use_en_text_encoder:
             en_text_features, en_text_features_imme, en_eot, en_attention = self.model_en.encode_text(en, self.self_attn_layers)
             en_text_features = self.normalize(en_text_features, eps=1e-10)

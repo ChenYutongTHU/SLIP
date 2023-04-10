@@ -14,7 +14,7 @@ import torch.backends.cudnn as cudnn
 import torch.utils.data
 import torchvision.transforms as transforms
 
-import datasets
+import Datasets
 import models
 from tokenizer import SimpleTokenizer
 import utils
@@ -80,7 +80,7 @@ def main(args):
     results = []
     for d in catalog:
         print('Evaluating {}'.format(d))
-        val_dataset = datasets.get_downstream_dataset(catalog, name=d, is_train=False, transform=val_transform)
+        val_dataset = Datasets.get_downstream_dataset(catalog, name=d, is_train=False, transform=val_transform)
 
         val_loader = torch.utils.data.DataLoader(
             val_dataset, batch_size=args.batch_size, shuffle=False,

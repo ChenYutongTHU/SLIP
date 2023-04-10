@@ -176,15 +176,15 @@ def knn_classifier(train_features, train_labels, test_features, test_labels, k, 
 
         retrieval_one_hot.resize_(batch_size * k, num_classes).zero_()
         retrieval_one_hot.scatter_(1, retrieved_neighbors.view(-1, 1), 1)
-        distances_transform = distances.clone().div_(T).exp_()
+        distances_transform = distances.clone().div_(T).exp_() #T temperature
         probs = torch.sum(
             torch.mul(
-                retrieval_one_hot.view(batch_size, -1, num_classes),
-                distances_transform.view(batch_size, -1, 1),
+                retrieval_one_hot.view(batch_size, -1, num_classes), #b,k,C
+                distances_transform.view(batch_size, -1, 1), #b, k, 1
             ),
             1,
         )
-        _, predictions = probs.sort(1, True)
+        _, predictions = probs.sort(1, True) #descending
 
         # find the predictions that match the target
         correct = predictions.eq(targets.data.view(-1, 1))
@@ -229,6 +229,7 @@ if __name__ == '__main__':
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument('--data_path', default='/data11/private/chenyutong/ILSVRC/Data/CLS-LOC', type=str)
+    parser.add_argument('--toolkit', default='torch', help='torch or bm')
     args = parser.parse_args()
 
     utils.init_distributed_mode(args)
