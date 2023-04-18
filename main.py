@@ -242,7 +242,8 @@ def main(args):
         elif k=='contrastive':
             train_dataset[k] = Datasets.get_dataset(
                     train_transform, tokenizer, args.dataset_contrastive, 
-                    args=args, need_only_text=False, read_tsv=True)
+                    args=args, need_only_text=False, read_tsv=True,
+                    lang=model.module.lang)
         else:
             raise ValueError
     '''
@@ -326,12 +327,15 @@ def main(args):
         wandb.run.save()
 
     print(args)
-    # if args.model in ['TRIPLET']:
-    #     print("=> Evaluation before training")
-    #     val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-    #     print(val_stats)
-    #     val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
-    #     print(val_stats)
+    if args.model in ['TRIPLET']:
+        print("=> Evaluation before training")
+        if 'poem' in args.dataset_contrastive:
+            val_stats = {}
+        else:
+            val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+        print(val_stats)
+        val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+        print(val_stats)
     print("=> beginning training")
     if args.training_unit=='step':
         args.epochs = math.ceil(args.steps/len(dataset2iteration['train_loader'][longest_dataset]))
@@ -357,7 +361,13 @@ def main(args):
             val_stats = {'acc1': -1}
             acc1 = -1
         elif args.model in ['TRIPLET']:
-            val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+            if 'poem' in args.dataset_contrastive:
+                val_stats = {}
+            else:
+                val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+            val_stats_retrieval = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+            val_stats = {**val_stats, **val_stats_retrieval}
+
             if args.eval_metric=='max':
                 acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
                             val_stats['zh+en_logits_acc1'], 
@@ -365,8 +375,6 @@ def main(args):
                             val_stats['zh+en_probs_acc1']) 
             else:
                 acc1 = val_stats[args.eval_metric]
-            val_stats_retrieval = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
-            val_stats = {**val_stats, **val_stats_retrieval}
         else:
             val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
             acc1 = val_stats['acc1']
@@ -382,7 +390,7 @@ def main(args):
                 'scaler': scaler.state_dict(),
                 'best_acc1': best_acc1,
                 'args': args,
-            }, is_best, args.output_dir)
+            }, is_best, args.output_dir, tag=f'-ep{epoch+1}')
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in val_stats.items()},
@@ -528,7 +536,10 @@ def train(dataset2iteration, longest_dataset, model, criterion, optimizer, scale
                 val_stats = {'acc1': -1}
                 acc1 = -1
             elif args.model in ['TRIPLET']:
-                val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+                if 'poem' in args.dataset_contrastive:
+                    val_stats = {}
+                else:
+                    val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
                 acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
                             val_stats['zh+en_logits_acc1'], 
                             val_stats['zh^en_logits_acc1'], 
@@ -571,7 +582,7 @@ def validate_retrieval_bilingual_text(model, tokenizer, args):
     model.eval()
     DATASET2FILE = {
         'coco-cn': 'data/coco_cn/coco_cn_test.json', #{'img_id':{'zh':,'en':}}
-        'un':'data/text_retrieval/un10k.json'
+        'un':'data/text_retrieval/un10k.json',
     }    
     if utils.is_main_process(): #one gpu is enough
         for dataset in ['un', 'coco-cn']:
@@ -636,13 +647,15 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
         'coco-cn': 'data/coco_cn/coco_cn_test.json', #{'img_id':{'zh':,'en':}}
         'aic':  'data/aic/aic_validation.json',
         'coco': '/data11/private/chenyutong/data/coco/val_karpathy.json',
+        'coco_poem7_2k': 'img2poem/pseudo_data/coco_poem7_2k.json',
     }
     DATASET2IMG = {
         'coco-cn': 'data/coco_cn/coco_cn_test_images/{}.jpg', #.format(img_id)
         'aic': 'data/aic/caption_validation_images_20170910/{}.jpg',
         'coco': '/data11/private/chenyutong/data/coco/images/val_karpathy/{}.jpg',
+        'coco_poem7_2k': 'img2poem/pseudo_data/coco_poem7_2k_images/{}.jpg',
     }
-    for dataset in ['coco-cn', 'aic']:#,'aic']:
+    for dataset in ['coco-cn','coco_poem7_2k']:#, 'aic']:#,'aic']:
         print(f'Evaluate Img<->Text Retrieval on {dataset} ...')
         with open(DATASET2FILE[dataset],'r') as f:
             img2captions = json.load(f)
@@ -851,8 +864,9 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
 
     cwd = os.path.dirname(os.path.realpath(__file__))
     with torch.no_grad():
+        id2lang_text_raw = {}
         id2lang_text,lang2text_features = {}, {'zh':[],'en':[]}
-        for lang in ['zh','en']:
+        for lang in ['en','zh']:
             lang2text_features[lang] = []
             templates = open(os.path.join(cwd,f'{lang}_templates.txt'),'r').readlines()
             templates = [t.strip() for t in templates]
@@ -862,7 +876,13 @@ def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
                 texts = [t.format(l) for t in templates]
                 if not id in id2lang_text:
                     id2lang_text[id] = {}
-                id2lang_text[id][lang] = tokenizer[lang](texts)
+                    id2lang_text_raw[id] = {}
+                id2lang_text_raw[id][lang] = texts
+                if utils.get_model(model).both_en=='different_arc' and lang=='zh':
+                    id2lang_text[id][lang] = tokenizer[lang](id2lang_text_raw[id]['en'])
+                else:
+                    id2lang_text[id][lang] = tokenizer[lang](texts)
+
         print('=> encoding captions')
         for id in tqdm(sorted(labels)):
             if args.model == 'TRIPLET':

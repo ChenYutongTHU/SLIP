@@ -20,7 +20,7 @@ def main(args):
     print('Load sentence embeddings ...')
     sentence_embeddings = torch.load(args.sentence_embed_path,map_location='cpu')
     assert len(sentences)==len(sentence_embeddings), (len(sentences),len(sentence_embeddings))
-    if os.path.isfile('.'.join(args.sentence_embed_path.split('.')[:-1])+'.keyword.pkl'):
+    if os.path.isfile('.'.join(args.keyword_path)):
         print('Load keywords ...')
         sentence_keywords = json.load(open(args.keyword_path,'r'))
         assert len(sentences)==len(sentence_keywords), (len(sentences),len(sentence_keywords))    
@@ -102,7 +102,8 @@ def main(args):
                 #keywords_per_subsent = sentence_keywords[i] #[] usually consists of two subsentences
             keywords = list(set(keywords))
 
-            if not args.model=='TRIPLET':
+            if not args.model=='TRIPLET' or sentence_keywords is None:
+                f.close()
                 continue
 
             f.writelines('==============Re-Ranking information==============\n')

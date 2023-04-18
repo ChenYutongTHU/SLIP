@@ -279,9 +279,9 @@ def is_main_process():
     return get_rank() == 0
 
 
-def save_on_master(state, is_best, output_dir):
+def save_on_master(state, is_best, output_dir, tag=""):
     if is_main_process():
-        ckpt_path = f'{output_dir}/checkpoint.pt'
+        ckpt_path = f'{output_dir}/checkpoint{tag}.pt'
         best_path = f'{output_dir}/checkpoint_best.pt'
         torch.save(state, ckpt_path)
         if is_best:

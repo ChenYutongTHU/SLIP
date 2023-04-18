@@ -9,6 +9,7 @@ from clip.model import Transformer, X_Attn_Encoder
 from copy import deepcopy
 import numpy as np
 import torch.distributed as dist
+from transformers import BertTokenizer, BertModel, BertConfig
 
 
 class AllGather(torch.autograd.Function):
@@ -49,6 +50,7 @@ class Triplet(torch.nn.Module):
         
         self.both_en = cfg.get('both_en',None) #'different_rand')
         if self.both_en==None:
+            self.lang = ['en','zh']
             if 'wukong' in cfg['Model_Zh'].lower():
                 self.model_zh_type = 'wukong'
                 self.model_zh, self.tokenize_zh = wukong.load(pkl_path=cfg['Model_Zh'],device=device,lang='zh',context_length=32)
@@ -59,12 +61,23 @@ class Triplet(torch.nn.Module):
                 #import ipdb; ipdb.set_trace()
                 # print(self.model_zh.dtype)
         else:
+            self.lang = ['en']
             if self.both_en=='different_rand':
                 self.model_zh_type = 'wukong'
                 self.model_zh = deepcopy(self.model_en)
                 self.tokenize_zh = self.tokenize_en
-            elif self.both_en=='different_architecture':
-                pass
+            elif self.both_en=='different_arc':
+                self.model_zh_type = 'bert'
+                self.model_zh = BertModel(
+                    config=BertConfig.from_pretrained("bert-base-uncased"),
+                    add_pooling_layer=False)
+                self.model_zh_text_projection = torch.nn.Linear(
+                        self.model_zh.config.hidden_size, self.model_en.embed_dim)
+                self.tokenize_zh_ = BertTokenizer.from_pretrained('bert-base-uncased')
+                self.tokenize_zh = lambda txt: self.tokenize_zh_(
+                        txt, padding='max_length',
+                        truncation=True, max_length=77,
+                        return_tensors='pt')['input_ids']
             else:
                 raise ValueError
 
@@ -78,7 +91,8 @@ class Triplet(torch.nn.Module):
         
         if cfg.get('from_scratch', False):
             print('Reinitialize model')
-            self.model_zh.initialize_parameters()
+            if self.model_zh_type != 'bert':
+                self.model_zh.initialize_parameters()
             self.model_en.initialize_parameters() 
             #import ipdb; ipdb.set_trace() 
 
@@ -279,7 +293,15 @@ class Triplet(torch.nn.Module):
                 zh_text_features, zh_attention = None, None
         else:
             assert en is not None, en #encode en!!
-            zh_text_features, zh_text_features_imme, zh_eot, zh_attention = self.model_zh.encode_text(en, self.self_attn_layers)
+            if self.model_zh_type == 'wukong':
+                zh_text_features, zh_text_features_imme, zh_eot, zh_attention = self.model_zh.encode_text(en, self.self_attn_layers)
+            elif self.model_zh_type == 'bert': #encode zh (different tokenizer)
+                #import ipdb; ipdb.set_trace()
+                attention_mask = (zh!=0).long() #B,L
+                zh_text_features = self.model_zh(zh, attention_mask)[0] #B,L,D
+                zh_text_features = zh_text_features[:,0,:]
+                #import ipdb; ipdb.set_trace()
+                zh_text_features = self.model_zh_text_projection(zh_text_features)  #B,D
             zh_text_features = self.normalize(zh_text_features, eps=1e-10)
 
 

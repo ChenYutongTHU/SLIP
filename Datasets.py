@@ -19,6 +19,7 @@ from read_tsv import TSVFile, img_from_base64
 import utils
 from model_center.dataset import DistributedMMapIndexedDataset, MMapIndexedDataset
 import bmtrain as bmt
+import random
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
@@ -176,12 +177,15 @@ class BilingualDataset_from_TSV(torch.utils.data.Dataset):
 
 
 class TripletDataset(torch.utils.data.Dataset):
-    def __init__(self, names, catalog, preprocess, tokenizer, need_img=True, txt_from_tsv=False) -> None:
+    def __init__(self, names, catalog, preprocess, tokenizer, 
+                 need_img=True, txt_from_tsv=False, lang=['zh','en'],
+                 poems_mode=False) -> None:
         super().__init__()
         self.names = names.split(',')
         self.name2triplets, self.name2tsv, self.name2tsv_txt = {},{},{}
         self.index2data = []
         self.txt_from_tsv = txt_from_tsv
+       # self.poems_mode = poems_mode
         for name in self.names:
             if self.txt_from_tsv==False:
                 self.name2triplets[name] = json.load(open(catalog[name]['metadata'], 'r'))
@@ -198,6 +202,7 @@ class TripletDataset(torch.utils.data.Dataset):
         self.preprocess = preprocess
         self.tokenizer = tokenizer
         self.need_img = need_img
+        self.lang = lang
         
     def __len__(self):
         return len(self.index2data)
@@ -206,18 +211,38 @@ class TripletDataset(torch.utils.data.Dataset):
         name, index = self.index2data[index]
         if self.txt_from_tsv:
             id = index
-            en, zh = self.name2tsv_txt[name].seek(index)
+            en_, zh_ = self.name2tsv_txt[name].seek(index)
+            if 'poem' in name:
+                #randomly select en_ or zh_ as zh_
+                if en_ != 'empty'  and zh_ != 'empty':
+                    if random.random() > 0.5:
+                        zh_ = en_
+                elif en_ != 'empty' and zh_ == 'empty':
+                    zh_ = en_
+                elif en_ == 'empty' and zh_ != 'empty':
+                    pass
+                else:
+                    raise ValueError 
         else:
-            img_name, id, en, zh = self.name2triplets[name][index]
+            img_name, id, en_, zh_ = self.name2triplets[name][index]
         if self.tokenizer is not None:
-            en = self.tokenizer['en'](en)
-            zh = self.tokenizer['zh'](zh)
+            if 'en' in self.lang:
+                en = self.tokenizer['en'](en_)
+            else:
+                en = self.tokenizer['en'](zh_)
+            if 'zh' in self.lang:
+                zh = self.tokenizer['zh'](zh_)
+            else:
+                zh = self.tokenizer['zh'](en_)
+        else:
+            en, zh = en_, zh_
         if self.need_img:
             row = self.name2tsv[name].seek(id)
+            img_id = self.name2tsv[name]._lineidx[id]
             image = img_from_base64(row[-1])
             if self.preprocess is not None:
                 image = self.preprocess(image)
-            return {'img':image, 'en':en, 'zh':zh, 'index': index}
+            return {'img':image, 'en':en, 'zh':zh, 'index': index, 'img_lineid': img_id}
         else:
             return {'en':en, 'zh':zh}
 
@@ -359,7 +384,8 @@ def get_downstream_dataset(catalog, name, is_train, transform):
     return dataset
 
 
-def get_dataset(train_transform, tokenizer, dataset_names, args, need_only_text=True, read_tsv=True):
+def get_dataset(train_transform, tokenizer, dataset_names, args, 
+                need_only_text=True, read_tsv=True, lang=['en','zh']):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
     augment = transforms.Compose([
@@ -389,7 +415,7 @@ def get_dataset(train_transform, tokenizer, dataset_names, args, need_only_text=
             else:
                 return TripletDataset(names=dataset_names, catalog=catalog,
                         preprocess=train_transform, tokenizer=tokenizer,
-                        need_img=True, txt_from_tsv=True)
+                        need_img=True, txt_from_tsv=True, lang=lang)
         if args.toolkit_data=='torch':
             return TripletDataset(names=dataset_names, catalog=catalog, preprocess=train_transform, 
                               tokenizer=tokenizer, need_img=need_img) # a dict
