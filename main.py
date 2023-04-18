@@ -39,6 +39,10 @@ def get_args_parser():
     #add 
     parser.add_argument('--distill_weight', type=float, default=1.0)
     parser.add_argument('--contrastive_weight', type=float, default=1.0)
+    parser.add_argument('--dataset_am', default='', type=str)
+    parser.add_argument('--loss_am', default='mse', type=str) #or info_nce
+    parser.add_argument('--am_weight', type=float, default=1.0)
+    parser.add_argument('--batch_size_am', type=int, default=512)
     #
     parser.add_argument('--eval_freq', type=int, default=1)
     parser.add_argument('--eval_metric', default='zh_acc1')
@@ -239,6 +243,10 @@ def main(args):
             train_dataset[k] = Datasets.get_dataset(
                     train_transform, tokenizer, args.dataset_distill, 
                     args=args, need_only_text=True, read_tsv=True)
+            if args.dataset_am!='':
+                train_dataset[k+'_am'] = Datasets.get_dataset(
+                    train_transform, tokenizer['zh'], args.dataset_am, 
+                    args=args, need_only_text=True, read_tsv=True, is_am=True)
         elif k=='contrastive':
             train_dataset[k] = Datasets.get_dataset(
                     train_transform, tokenizer, args.dataset_contrastive, 
@@ -264,7 +272,10 @@ def main(args):
                 'train_loader': {}, 'train_sampler': {},
                 'train_iter': {}, 'train_step':{}}
         longest_dataset = None
-        args.mode2batch_size = {'distill':args.batch_size_distill, 'contrastive':args.batch_size_contrastive}
+        args.mode2batch_size = {
+            'distill':args.batch_size_distill, 
+            'contrastive':args.batch_size_contrastive,
+            'distill_am': args.batch_size_am}
         for k, d in train_dataset.items():
             if args.distributed:
                 dataset2iteration['train_sampler'][k] = torch.utils.data.distributed.DistributedSampler(d)
@@ -327,15 +338,15 @@ def main(args):
         wandb.run.save()
 
     print(args)
-    if args.model in ['TRIPLET']:
-        print("=> Evaluation before training")
-        if 'poem' in args.dataset_contrastive:
-            val_stats = {}
-        else:
-            val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-        print(val_stats)
-        val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
-        print(val_stats)
+    # if args.model in ['TRIPLET']:
+    #     print("=> Evaluation before training")
+    #     if 'poem' in args.dataset_contrastive:
+    #         val_stats = {}
+    #     else:
+    #         val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+    #     print(val_stats)
+    #     val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+    #     print(val_stats)
     print("=> beginning training")
     if args.training_unit=='step':
         args.epochs = math.ceil(args.steps/len(dataset2iteration['train_loader'][longest_dataset]))
@@ -418,7 +429,7 @@ def get_next_batch(dataset2iteration, k):
         dataset2iteration['train_step'][k][2] += 1
         dataset2iteration['train_iter'][k] = iter(dataset2iteration['train_loader'][k])    
         dataset2iteration['train_step'][k][0] = 0 
-        # print('Reset loader', k, dataset2iteration['cur_epoch'])  
+        print('Reset loader', k, dataset2iteration['cur_epoch'])  
     return data
 
 def train(dataset2iteration, longest_dataset, model, criterion, optimizer, scaler, epoch, lr_schedule, args, val_loader, tokenizer, val_transform, end_step):
@@ -464,16 +475,24 @@ def train(dataset2iteration, longest_dataset, model, criterion, optimizer, scale
                 if args.model=='TRIPLET':
                     if args.toolkit=='bm':
                         inputs = {k:tensor.cuda(args.gpu, non_blocking=True) for k,tensor in inputs.items()}
-                    loss_dict_per_key[k], features_dict, acc_dict_per_key[k] = model(
-                        mode=k,
-                        img=inputs.get('img',None),
-                        en=inputs['en'].squeeze(1), zh=inputs['zh'].squeeze(1))
+                    if k  in ['distill', 'contrastive']:
+                        loss_dict_per_key[k], features_dict, acc_dict_per_key[k] = model(
+                            mode=k,
+                            img=inputs.get('img',None),
+                            en=inputs['en'].squeeze(1), zh=inputs['zh'].squeeze(1))
+                    elif k=='distill_am':
+                        loss_dict_per_key[k], acc_dict_per_key[k] = model(
+                            mode=k, img=None, 
+                            zh1=inputs['zh1'].squeeze(1), zh2=inputs['zh2'].squeeze(1))
+                        
                     loss_dict = {**loss_dict, **loss_dict_per_key[k]}
                     acc_dict = {**acc_dict, **acc_dict_per_key[k]}
                     if k=='distill':
                         weight = args.distill_weight
                     elif k=='contrastive':
                         weight = args.contrastive_weight
+                    elif k=='distill_am':
+                        weight = args.am_weight
                     else:
                         raise ValueError
                     loss += loss_dict_per_key[k][f'{k}_total_loss']*weight

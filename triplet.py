@@ -53,7 +53,8 @@ class Triplet(torch.nn.Module):
             self.lang = ['en','zh']
             if 'wukong' in cfg['Model_Zh'].lower():
                 self.model_zh_type = 'wukong'
-                self.model_zh, self.tokenize_zh = wukong.load(pkl_path=cfg['Model_Zh'],device=device,lang='zh',context_length=32)
+                self.model_zh, self.tokenize_zh = wukong.load(pkl_path=cfg['Model_Zh'],device=device,lang='zh',
+                                                              context_length=cfg.get('zh_context_length', 32))
             elif 'mengzi' in cfg['Model_Zh'].lower():
                 self.model_zh_type = 'mengzi'
                 output_dim = self.model_en.embed_dim
@@ -324,17 +325,28 @@ class Triplet(torch.nn.Module):
 
     def forward_only_distillation(self, en, zh):
         with torch.no_grad():
-            en_text_features, _, _ = self.model_en.encode_text(en) #B,D
-        zh_text_features, _, _ = self.model_zh.encode_text(zh) #B,D
+            en_text_features, _, _, _ = self.model_en.encode_text(en) #B,D
+        zh_text_features, _, _, _ = self.model_zh.encode_text(zh) #B,D
         loss_dict = {}
         loss_dict['distillation_loss'] = torch.nn.functional.mse_loss(zh_text_features, en_text_features, reduction='mean') 
         loss_dict['distillation_loss'] *= self.loss_weight['distillation']
         loss_dict['distill_total_loss'] = loss_dict['distillation_loss']
         return loss_dict
     
-    def forward(self, mode, en=None, zh=None, img=None):
-        if (self.only_distillation and img==None) or mode=='distill':
+    def forward_distill_am(self, zh1, zh2):
+        zh1_text_features, _, _, _ = self.model_zh.encode_text(zh1)
+        zh2_text_features, _, _, _ = self.model_zh.encode_text(zh2)
+        loss_dict = {}
+        #loss_dict['distillation_am_loss'] = torch.nn.functional.mse_loss(zh1_text_features, zh2_text_features, reduction='mean')
+        loss_dict['distill_am_total_loss'] = torch.nn.functional.mse_loss(zh1_text_features, zh2_text_features, reduction='mean')
+        return loss_dict
+
+    def forward(self, mode, en=None, zh=None, img=None, zh1=None, zh2=None):
+        if mode == 'distill_am':
+            return self.forward_distill_am(zh1=zh1, zh2=zh2), {}
+        elif (self.only_distillation and img==None) or mode=='distill':
             return self.forward_only_distillation(en=en, zh=zh), {}, {}
+        
         image_features = self.encode_image(img)
         image_features = self.normalize(image_features)
 

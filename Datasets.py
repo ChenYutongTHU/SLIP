@@ -175,6 +175,28 @@ class BilingualDataset_from_TSV(torch.utils.data.Dataset):
         zh = self.tokenizer['zh'](zh)        
         return {'en':en, 'zh':zh}
 
+class ParallelDataset_from_TSV(torch.utils.data.Dataset):
+    def __init__(self, names, catalog, tokenizer):
+        super().__init__()
+        self.names = names.split(',')
+        self.name2tsv = {}
+        self.index2data = []
+        for name in self.names:
+            self.name2tsv[name] = TSVFile(catalog[name]["tsv_txt"])
+            self.index2data.extend([(name,i) for i in range(len(self.name2tsv[name]))])
+            print(f'Load {name}(#={len(self.name2tsv[name])}) from {catalog[name]["tsv_txt"]} ...')
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.index2data)
+
+    def __getitem__(self, index):
+        name, ith = self.index2data[index]
+        zh1, zh2 = self.name2tsv[name].seek(ith)
+        zh1 = self.tokenizer(zh1)
+        zh2 = self.tokenizer(zh2)       
+        return {'zh1':zh1, 'zh2':zh2}
+    
 
 class TripletDataset(torch.utils.data.Dataset):
     def __init__(self, names, catalog, preprocess, tokenizer, 
@@ -385,7 +407,8 @@ def get_downstream_dataset(catalog, name, is_train, transform):
 
 
 def get_dataset(train_transform, tokenizer, dataset_names, args, 
-                need_only_text=True, read_tsv=True, lang=['en','zh']):
+                need_only_text=True, read_tsv=True, lang=['en','zh'],
+                is_am=False):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
     augment = transforms.Compose([
@@ -411,7 +434,10 @@ def get_dataset(train_transform, tokenizer, dataset_names, args,
         catalog = json.load(open('dataset_catalog.json', 'r'))
         if read_tsv:
             if need_img==False:
-                return BilingualDataset_from_TSV(names=dataset_names, catalog=catalog, tokenizer=tokenizer)
+                if is_am:
+                    return ParallelDataset_from_TSV(names=dataset_names, catalog=catalog, tokenizer=tokenizer)
+                else:
+                    return BilingualDataset_from_TSV(names=dataset_names, catalog=catalog, tokenizer=tokenizer)
             else:
                 return TripletDataset(names=dataset_names, catalog=catalog,
                         preprocess=train_transform, tokenizer=tokenizer,
