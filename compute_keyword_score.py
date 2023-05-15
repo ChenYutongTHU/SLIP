@@ -1,6 +1,6 @@
 
 import argparse, os, pickle, json
-from compute_sent_embedding import segment_sentence
+from compute_sent_embedding_deprecated import segment_sentence
 from transformers import BertModel, BertTokenizer
 import torch
 from tqdm import tqdm 

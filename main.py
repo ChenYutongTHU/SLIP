@@ -251,7 +251,7 @@ def main(args):
             train_dataset[k] = Datasets.get_dataset(
                     train_transform, tokenizer, args.dataset_contrastive, 
                     args=args, need_only_text=False, read_tsv=True,
-                    lang=model.module.lang)
+                    lang=getattr(model.module, 'lang', 'zh'))
         else:
             raise ValueError
     '''
@@ -263,7 +263,11 @@ def main(args):
     val_dataset = ImageNetValDataset(
         transform=val_transform, 
         location='../CLIP_distillation')
-
+    if args.dataset_am!='': 
+        val_dataset_am = Datasets.get_dataset(
+            train_transform=None,   
+            tokenizer=tokenizer['zh'], dataset_names='am_test2k',
+            args=args, need_only_text=True, read_tsv=True, is_am=True)
     # dist eval resamples data to pad uneven batch sizes
     # make sure num_samples = 0 mod num_gpus for exact acc
 
@@ -296,6 +300,10 @@ def main(args):
         val_loader = torch.utils.data.DataLoader(
             val_dataset, batch_size=args.batch_size_eval, shuffle=(val_sampler is None),
             num_workers=args.workers, pin_memory=True, sampler=val_sampler, drop_last=False)
+        if args.dataset_am!='':
+            val_loader_am = torch.utils.data.DataLoader(
+                val_dataset_am, batch_size=args.batch_size_eval, shuffle=False,
+                num_workers=args.workers, pin_memory=True, sampler=None, drop_last=False)
     elif args.toolkit=='bm': #(bm.get_rank())
         raise ValueError
         train_loader = DistributedDataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
@@ -340,13 +348,20 @@ def main(args):
     print(args)
     # if args.model in ['TRIPLET']:
     #     print("=> Evaluation before training")
-    #     if 'poem' in args.dataset_contrastive:
-    #         val_stats = {}
-    #     else:
-    #         val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-    #     print(val_stats)
-    #     val_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
-    #     print(val_stats)
+    #     val_stats = {}
+    #     if args.dataset_am!='':
+    #         val_stats_am = validate_am(val_loader_am, model, tokenizer['zh'], args)
+    #         print(val_stats_am)
+    #         val_stats = {**val_stats, **val_stats_am}
+
+    #     if 'poem' not in args.dataset_contrastive:
+    #         val_stats_ic = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+    #         print(val_stats_ic)
+    #         val_stats = {**val_stats, **val_stats_ic}
+
+    #     val_stats_bi = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+    #     print(val_stats_bi)
+
     print("=> beginning training")
     if args.training_unit=='step':
         args.epochs = math.ceil(args.steps/len(dataset2iteration['train_loader'][longest_dataset]))
@@ -372,12 +387,20 @@ def main(args):
             val_stats = {'acc1': -1}
             acc1 = -1
         elif args.model in ['TRIPLET']:
-            if 'poem' in args.dataset_contrastive:
-                val_stats = {}
-            else:
-                val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-            val_stats_retrieval = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
-            val_stats = {**val_stats, **val_stats_retrieval}
+            val_stats = {}
+            if args.dataset_am!='':
+                val_stats_am = validate_am(val_loader_am, model, tokenizer['zh'], args)
+                print(val_stats_am)
+                val_stats = {**val_stats, **val_stats_am}
+
+            if 'poem' not in args.dataset_contrastive or False:
+                val_stats_ic = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
+                print(val_stats_ic)
+                val_stats = {**val_stats, **val_stats_ic}
+
+            val_stats_bi = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
+            print(val_stats_bi)
+            val_stats = {**val_stats, **val_stats_bi}
 
             if args.eval_metric=='max':
                 acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
@@ -555,16 +578,17 @@ def train(dataset2iteration, longest_dataset, model, criterion, optimizer, scale
                 val_stats = {'acc1': -1}
                 acc1 = -1
             elif args.model in ['TRIPLET']:
-                if 'poem' in args.dataset_contrastive:
+                if 'poem' in args.dataset_contrastive or True:
                     val_stats = {}
                 else:
                     val_stats = validate_zeroshot_bilingual(val_loader, model, tokenizer, args)
-                acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
-                            val_stats['zh+en_logits_acc1'], 
-                            val_stats['zh^en_logits_acc1'], 
-                            val_stats['zh+en_probs_acc1'])
+                # acc1 = max(val_stats['zh_acc1'],val_stats['en_acc1'],
+                #             val_stats['zh+en_logits_acc1'], 
+                #             val_stats['zh^en_logits_acc1'], 
+                #             val_stats['zh+en_probs_acc1'])
                 val_stats_re = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
                 val_stats = {**val_stats, **val_stats_re}
+                acc1 = val_stats[args.eval_metric]
             else:
                 val_stats = validate_zeroshot(val_loader, model, tokenizer, args)
                 acc1 = val_stats['acc1']
@@ -581,7 +605,7 @@ def train(dataset2iteration, longest_dataset, model, criterion, optimizer, scale
                     'scaler': scaler.state_dict(),
                     'best_acc1': best_acc1,
                     'args': args,
-                }, is_best, args.output_dir)
+                }, is_best, args.output_dir, tag=f'ep{epoch}-stp{data_iter}')
 
             log_stats = {**{f'test_{k}': v for k, v in val_stats.items()},
                         'epoch': epoch, 'step':data_iter}
@@ -667,14 +691,24 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
         'aic':  'data/aic/aic_validation.json',
         'coco': '/data11/private/chenyutong/data/coco/val_karpathy.json',
         'coco_poem7_2k': 'img2poem/pseudo_data/coco_poem7_2k.json',
+        'pseudo': 'img2poem/pseudo/pseudo.json',
+        'fengzikai': 'img2poem/pseudo/fengzikai.json',
+        'parallel': 'img2poem/pseudo/parallel.json',
+        'pseudo_translated': 'img2poem/pseudo/pseudo_translated.json',
+        'fengzikai_translated': 'img2poem/pseudo/fengzikai_translated.json',
+        'parallel_translated': 'img2poem/pseudo/parallel_translated.json',
     }
     DATASET2IMG = {
         'coco-cn': 'data/coco_cn/coco_cn_test_images/{}.jpg', #.format(img_id)
         'aic': 'data/aic/caption_validation_images_20170910/{}.jpg',
         'coco': '/data11/private/chenyutong/data/coco/images/val_karpathy/{}.jpg',
         'coco_poem7_2k': 'img2poem/pseudo_data/coco_poem7_2k_images/{}.jpg',
+        'pseudo': 'img2poem/pseudo/{}',
+        'fengzikai': 'img2poem/pseudo/{}', 'parallel': 'img2poem/pseudo/{}',
+        'pseudo_translated': 'img2poem/pseudo/{}',
+        'fengzikai_translated': 'img2poem/pseudo/{}', 'parallel_translated': 'img2poem/pseudo/{}',
     }
-    for dataset in ['coco-cn','coco_poem7_2k']:#, 'aic']:#,'aic']:
+    for dataset in ['coco-cn','pseudo_translated','fengzikai_translated', 'parallel_translated','coco_poem7_2k']:#, 'aic']:#,'aic']:
         print(f'Evaluate Img<->Text Retrieval on {dataset} ...')
         with open(DATASET2FILE[dataset],'r') as f:
             img2captions = json.load(f)
@@ -683,7 +717,10 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
         img_files = []
         imgid2capid, capid2imgid = [], []
         for img_id, c in img2captions.items():
-            c['zh'], c['en'] = c['zh'][:5], c['en'][:5] ##a dirty solution, only use the first 5 sentences
+            if '_translated' in dataset:
+                c['zh'], c['en'] = c['zh'], c['zh0']
+            else:
+                c['zh'], c['en'] = c['zh'][:5], c['en'][:5] ##a dirty solution, only use the first 5 sentences
             capid2imgid.extend([len(img_ids)]*len(c['zh']))
             img_ids.append(img_id)
             img_files.append(DATASET2IMG[dataset].format(img_id))
@@ -705,9 +742,11 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
             en_caps_ +=[en_caps[-1] for _ in range(right-left, chunk_size)]
         #import ipdb; ipdb.set_trace()
         val_dataset = Datasets.TripletDataset_from_rawfile(
-            img_file=img_files_, zh=zh_caps_, en=en_caps_, preprocess=val_transform, tokenizer=tokenizer)
+            img_file=img_files_, zh=zh_caps_, en=en_caps_, 
+            preprocess=val_transform, 
+            tokenizer=tokenizer if not "_translated" in dataset else {'zh':tokenizer['zh'], 'en':tokenizer['zh']})
         val_dataloader = torch.utils.data.DataLoader(
-            val_dataset, batch_size=128, shuffle=False,
+            val_dataset, batch_size=64, shuffle=False,
                 num_workers=args.workers, pin_memory=True, drop_last=False)
 
         image_embeddings_all = []
@@ -719,23 +758,57 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
                 image_features = utils.get_model(model).encode_image(img.cuda())
                 if args.model == 'TRIPLET':
                     en, zh = en.reshape(-1,en.shape[-1]), zh.reshape(-1,zh.shape[-1])
-                    zh_embeddings, en_embeddings, bi_embeddings = \
-                        utils.get_model(model).encode_text(zh=zh.cuda(), en=en.cuda()) #already normalize
+                    if '_translated' in dataset:
+                        en_embeddings, _, _ = utils.get_model(model).encode_text(zh=en.cuda(), en=None)
+                        zh_embeddings, _, _ = utils.get_model(model).encode_text(zh=zh.cuda(), en=None)
+                    else:
+                        zh_embeddings, en_embeddings, _ = \
+                            utils.get_model(model).encode_text(zh=zh.cuda(), en=en.cuda()) #already normalize
+                    if '_translated' in dataset:
+                        #bi_embeddings is the normalized average of zh and en embeddings
+                        bi_embeddings = (zh_embeddings + en_embeddings) / 2
+                        bi_embeddings = bi_embeddings / bi_embeddings.norm(dim=-1, keepdim=True)
+                    else:
+                        bi_embeddings = []
                 else:
-                    zh_embeddings, en_embeddings, bi_embeddings = [], [], None
+                    zh_embeddings, en_embeddings, bi_embeddings = [], [], []
+                    zh['input_ids'] = zh['input_ids'].reshape(-1,zh['input_ids'].shape[-1]) #*5,77
+                    en['input_ids'] = en['input_ids'].reshape(-1,en['input_ids'].shape[-1]) #*5,77
+                    zh['attention_mask'] = zh['attention_mask'].reshape(-1,zh['attention_mask'].shape[-1]) #*5,77
+                    en['attention_mask'] = en['attention_mask'].reshape(-1,en['attention_mask'].shape[-1]) #*5,77
                     batch_size = 16
                     n_batch = math.ceil(len(zh['input_ids'])/batch_size)
                     for i in range(n_batch):
                         s, t = i*batch_size, min((i+1)*batch_size, len(zh['input_ids']))
-                        zh_emb, en_emb = utils.get_model(model).encode_text(
-                                zh_input_ids=zh['input_ids'][s:t,0].cuda(args.gpu, non_blocking=True), 
-                                en_input_ids=en['input_ids'][s:t,0].cuda(args.gpu, non_blocking=True), 
-                                zh_attention_mask=zh['attention_mask'][s:t,0].cuda(args.gpu, non_blocking=True), 
-                                en_attention_mask=en['attention_mask'][s:t,0].cuda(args.gpu, non_blocking=True))
+                        if '_translated' in dataset:
+                            zh_emb, _ = utils.get_model(model).encode_text(
+                                    zh_input_ids=zh['input_ids'][s:t].cuda(args.gpu, non_blocking=True), 
+                                    en_input_ids=None, 
+                                    zh_attention_mask=zh['attention_mask'][s:t].cuda(args.gpu, non_blocking=True), 
+                                    en_attention_mask=None)
+                            en_emb, _ = utils.get_model(model).encode_text(
+                                    zh_input_ids=en['input_ids'][s:t].cuda(args.gpu, non_blocking=True), 
+                                    en_input_ids=None, 
+                                    zh_attention_mask=en['attention_mask'][s:t].cuda(args.gpu, non_blocking=True), 
+                                    en_attention_mask=None)
+                        else:
+                            zh_emb, en_emb = utils.get_model(model).encode_text(
+                                    zh_input_ids=zh['input_ids'][s:t].cuda(args.gpu, non_blocking=True), 
+                                    en_input_ids=en['input_ids'][s:t].cuda(args.gpu, non_blocking=True), 
+                                    zh_attention_mask=zh['attention_mask'][s:t].cuda(args.gpu, non_blocking=True), 
+                                    en_attention_mask=en['attention_mask'][s:t].cuda(args.gpu, non_blocking=True))
+                        #import ipdb; ipdb.set_trace()
                         zh_embeddings.append(zh_emb)
                         en_embeddings.append(en_emb)
+                        if '_translated' in dataset:
+                            bi_emb = (zh_emb+en_emb)/2
+                            #normalize bi_emb
+                            bi_emb = bi_emb / bi_emb.norm(dim=-1, keepdim=True)
+                            bi_embeddings.append(bi_emb)
                     zh_embeddings = torch.cat(zh_embeddings, dim=0)
                     en_embeddings = torch.cat(en_embeddings, dim=0)
+                    if '_translated' in dataset:
+                        bi_embeddings = torch.cat(bi_embeddings, dim=0)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             image_embeddings_all.append(image_features)
             en_embeddings_all.append(en_embeddings)
@@ -748,26 +821,42 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
         image_embeddings_all = image_embeddings_all[:len(img_files)]
         text_embeddings = {}
         for k,v in [['zh',zh_embeddings_all],['en',en_embeddings_all],['bi',bi_embeddings_all]]:
-            if v[-1] is not None:
+            if v[-1] is not None and v[-1] != []:
                 text_embeddings[k] = torch.cat(v, dim=0)
                 text_embeddings[k] = utils.all_gather_tensor(text_embeddings[k])
                 text_embeddings[k] = text_embeddings[k][:pt]
                 print(k, len(text_embeddings[k]))
         #gather
-        for lang in ['zh','en','bi']:
-            if not lang in text_embeddings:
+        logit_scale = utils.get_model(model).logit_scale.exp()
+        lang_i2t_sim, lang_t2i_sim = {'zh':[],'en':[]}, {'zh':[],'en':[]}
+        for lang in ['zh','en','bi','zh+en_prob', 'zh+en_emb']:
+            if lang=='en' and not 'en' in text_embeddings:
+                break
+            if not lang in text_embeddings and 'zh+en' not in lang:
                 continue
             #direction Image->Text
             acc1, acc5 = [], []
             for i, (image_embedding, capids) in enumerate(zip(image_embeddings_all, imgid2capid)):
-                i2t_sim = image_embedding@text_embeddings[lang].t() #D,(D,nT)
+                if lang in ['zh','en','bi']:
+                    i2t_sim = logit_scale*image_embedding@text_embeddings[lang].t() #D,(D,nT)
+                elif lang=='zh+en_prob':
+                    i2t_sim_zh = logit_scale*image_embedding@text_embeddings['zh'].t() #D,(D,nT)
+                    i2t_sim_zh = torch.nn.functional.softmax(i2t_sim_zh, dim=-1)
+                    i2t_sim_en = logit_scale*image_embedding@text_embeddings['en'].t() #D,(D,nT)
+                    i2t_sim_en = torch.nn.functional.softmax(i2t_sim_en, dim=-1)
+                    i2t_sim = (i2t_sim_zh + i2t_sim_en)/2
+                elif lang=='zh+en_emb':
+                    i2t_sim = logit_scale*image_embedding@(text_embeddings['zh']+text_embeddings['en']).t() #D,(D,nT)
                 pred_topk = (torch.topk(i2t_sim, k=5, dim=-1).indices).tolist()
+                #import ipdb; ipdb.set_trace()
                 acc1.append(pred_topk[0] in capids)
                 acc5.append(np.max([cid in pred_topk for cid in capids]))
             acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
             val_stats[f'{dataset}_I2T_acc1_{lang}'] = round(acc1,2)
             val_stats[f'{dataset}_I2T_acc5_{lang}'] = round(acc5,2)
             print('{}({}) acc1={:.2f} acc5={:.2f}'.format('Image->Text', lang, acc1, acc5))
+            
+            '''
             #direction Text->Image
             acc1, acc5 = [], []
             for i, (text_embedding, imgid) in enumerate(zip(text_embeddings[lang], capid2imgid)):
@@ -778,7 +867,8 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
             acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
             val_stats[f'{dataset}_T2I_acc1_{lang}'] = round(acc1,2)
             val_stats[f'{dataset}_T2I_acc5_{lang}'] = round(acc5,2)
-            print('{}({}) acc1={:.2f} acc5={:.2f}'.format('Text->Image', lang, acc1, acc5))                                
+            print('{}({}) acc1={:.2f} acc5={:.2f}'.format('Text->Image', lang, acc1, acc5)) 
+            '''                               
     #dist.barrier()
     dist_synchronize()
     model.train()
@@ -866,6 +956,53 @@ def validate_retrieval_bilingual_single(model, val_transform, tokenizer, args):
     #dist.barrier()
     dist_synchronize()
     model.train()
+
+
+def validate_am(val_loader, model, tokenizer, args):
+    model.eval()
+    val_metrics = {}
+    with torch.no_grad():
+        #for each zh1 and zh2 in val_loader, compute their embeddings using model.encode_text
+        val_loss = 0
+        zh1_fea, zh2_fea = [], []
+        for batch in val_loader:
+            zh1, zh2 = batch['zh1'], batch['zh2']
+            zh1, zh2 = zh1.cuda().squeeze(1), zh2.cuda().squeeze(1)
+            zh1_text_features, _, _, _ = utils.get_model(model).model_zh.encode_text(zh1)
+            zh2_text_features, _, _, _ = utils.get_model(model).model_zh.encode_text(zh2)
+            #mse loss betweeh zh1_text_features and zh2_text_features
+            val_loss += torch.nn.functional.mse_loss(zh1_text_features, zh2_text_features, reduction='sum').item()
+            zh1_fea.append(zh1_text_features)
+            zh2_fea.append(zh2_text_features)
+    val_metrics['am_mse_avg'] = val_loss/len(val_loader.dataset)
+    zh1_fea = torch.cat(zh1_fea, dim=0)
+    zh2_fea = torch.cat(zh2_fea, dim=0)
+    #normalize zh1_fea and zh2_fea
+    zh1_fea = zh1_fea / zh1_fea.norm(dim=-1, keepdim=True)
+    zh2_fea = zh2_fea / zh2_fea.norm(dim=-1, keepdim=True)
+    #compute  the similarity matrix between zh1_fea and zh2_fea
+    #compute the accuracy
+    acc1, acc5 = [], []
+    for i, (zh1, zh2) in enumerate(zip(zh1_fea, zh2_fea)):
+        sim = zh1@zh2_fea.t()
+        pred_topk = (torch.topk(sim, k=5, dim=-1).indices).tolist()
+        acc1.append(pred_topk[0]==i)
+        acc5.append(i in pred_topk)
+    acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
+    val_metrics['a2m_acc1'] = acc1
+    val_metrics['a2m_acc5'] = acc5
+    #the other direction
+    acc1, acc5 = [], []
+    for i, (zh1, zh2) in enumerate(zip(zh1_fea, zh2_fea)):
+        sim = zh2@zh1_fea.t()
+        pred_topk = (torch.topk(sim, k=5, dim=-1).indices).tolist()
+        acc1.append(pred_topk[0]==i)
+        acc5.append(i in pred_topk)
+    acc1, acc5 = np.mean(acc1)*100, np.mean(acc5)*100
+    val_metrics['m2a_acc1'] = acc1
+    val_metrics['m2a_acc5'] = acc5
+    return val_metrics
+
 
 def validate_zeroshot_bilingual(val_loader, model, tokenizer, args):
     model.eval()

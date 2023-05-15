@@ -11,24 +11,34 @@ import torchvision.transforms as transforms
 TEMPLATES=['这张图片里有{}。']
 def main(args):
     model = build_and_load_model(args.model, args.model_cfg_path, args.model_path)
+    utils.get_model(model).logit_scale.data.clamp_(0, 4.6052)
+    logit_scale = utils.get_model(model).logit_scale.exp().item()
     if args.model=='TRIPLET':
         tokenizer = utils.get_model(model).tokenize_zh
     model.cuda(args.gpu)
-    print('Load sentence ...')
-    sentences = json.load(open(args.sentence_path,'r'))
+    print('Load id2poem ...')
     id2poem = json.load(open(args.id2poem_path,'r'))
-    print('Load sentence embeddings ...')
-    sentence_embeddings = torch.load(args.sentence_embed_path,map_location='cpu')
-    assert len(sentences)==len(sentence_embeddings), (len(sentences),len(sentence_embeddings))
-    
+
+    print('Load sentences and their embeddings ...')
+    sentence_list, sentence_embeddings_list = [], []
+    num_sentence = None
+    for sf, ef in zip(args.sentence_paths.split(','), args.sentence_embed_paths.split(',')):
+        print(f'Load {sf} & {ef}')
+        sentence_list.append(json.load(open(sf,'r')))
+        sentence_embeddings_list.append(torch.load(ef,map_location='cpu'))
+        assert len(sentence_list[-1])==len(sentence_embeddings_list[-1]), (len(sentence_list[-1]),len(sentence_embeddings_list[-1]))
+        if num_sentence is None:
+            num_sentence = len(sentence_list[-1])
+        else:
+            assert num_sentence==len(sentence_list[-1]), (num_sentence,len(sentence_list[-1]))
     if args.rerank and os.path.isfile('.'.join(args.keyword_path)):
         print('Load keywords ...')
         sentence_keywords = json.load(open(args.keyword_path,'r'))
-        assert len(sentences)==len(sentence_keywords), (len(sentences),len(sentence_keywords))    
+        assert num_sentence==len(sentence_keywords), (num_sentence,len(sentence_keywords))    
     else:
         print('Skip keywords loading')
         sentence_keywords = None
-    print(f'#sentences={len(sentence_embeddings)}')
+    print(f'#sentences={num_sentence}')
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
@@ -75,42 +85,54 @@ def main(args):
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             image_feature = image_features.squeeze(0)
             
-            sims = []
-            n_batch = math.ceil(len(sentence_embeddings)/args.batch_size)
-            for i in tqdm(range(n_batch)):
-                s,t = args.batch_size*i, min(args.batch_size*(i+1),len(sentence_embeddings)) 
-                sent_features = torch.stack(sentence_embeddings[s:t], dim=0).cuda() #N,D
-                # print(image_feature.shape, sent_features.shape)
-                sim = image_feature@sent_features.t()
-                sims.append(sim)
-            sims = torch.cat(sims, dim=0)
-            sorted_, indices = torch.sort(sims, descending=True)
+            si2sim= []
+            for si, sentence_embeddings in enumerate(sentence_embeddings_list):
+                sims = []
+                n_batch = math.ceil(num_sentence/args.batch_size)
+                for i in tqdm(range(n_batch)):
+                    s,t = args.batch_size*i, min(args.batch_size*(i+1),num_sentence) 
+                    sent_features = torch.stack(sentence_embeddings[s:t], dim=0).cuda() #N,D
+                    # print(image_feature.shape, sent_features.shape)
+                    sim = logit_scale*image_feature@sent_features.t()
+                    sims.append(sim)
+                sims = torch.cat(sims, dim=0)
+                si2sim.append(sims)
+            
+            si2sim.append(sum(si2sim)/len(si2sim))
             output_file = os.path.join(args.output_dir, img_path.replace('/','-')+'.txt')
             f = open(output_file,'w')
-            f.writelines('==============Ranked by Chinese-CLIP==============\n')
-            keywords = []
-            for rank, i in enumerate(indices[:args.topk]):
-                rank += 1
-                #f.writelines(f'Top {rank}:\n')
-                if type(sentences[i])==dict:
-                    if 'id' in sentences[i]:
-                        poem = id2poem[sentences[i]['id']]
-                    elif 'poem_id' in sentences[i]:
-                        poem = id2poem[sentences[i]['poem_id']]
-                    else:
-                        poem = None
-                    if poem is not None:
-                        author, dynasty, title = poem['author'], poem['dynasty'], poem['title']
-                    f.writelines(f'{i}: {round(sims[i].item(),3)} {sentences[i]["content"]}  --《{title}》 {author}[{dynasty}]\n')
-                    # f.writelines(f'{i}:{sentences[i]["content"]}  --《{title}》 {author}[{dynasty}]\n')
+            for si, sims in enumerate(si2sim):
+                if si<len(sentence_list):
+                    sentences = sentence_list[si]
                 else:
-                    f.writelines(f'{i}:{sentences[i]}\n')
-                if sentence_keywords is not None:
-                    kws = sentence_keywords[i] #[[w1,w2,w3],[w1,w2,w3]]
-                    keywords.extend(kws[0]+kws[1])
-                # f.writelines(f'score:{round(sims[i].item(),3)}\n')
-                # f.writelines('\n\n')
-                #keywords_per_subsent = sentence_keywords[i] #[] usually consists of two subsentences
+                    sentences = [{'content':'\n'.join([sl[ii]['content'] for sl in sentence_list]),
+                                  'poem_id':sentence_list[0][ii]['poem_id']} \
+                                    for ii in range(num_sentence)]
+                sorted_, indices = torch.sort(sims, descending=True)
+                f.writelines(f'==============Ranked by Embedding-{si}==============\n')
+                keywords = []
+                for rank, i in enumerate(indices[:args.topk]):
+                    rank += 1
+                    #f.writelines(f'Top {rank}:\n')
+                    if type(sentences[i])==dict:
+                        if 'id' in sentences[i]:
+                            poem = id2poem[sentences[i]['id']]
+                        elif 'poem_id' in sentences[i]:
+                            poem = id2poem[sentences[i]['poem_id']]
+                        else:
+                            poem = None
+                        if poem is not None:
+                            author, dynasty, title = poem['author'], poem['dynasty'], poem['title']
+                        f.writelines(f'{i}: {round(sims[i].item(),3)} {sentences[i]["content"]}  --《{title}》 {author}[{dynasty}]\n')
+                        # f.writelines(f'{i}:{sentences[i]["content"]}  --《{title}》 {author}[{dynasty}]\n')
+                    else:
+                        f.writelines(f'{i}:{sentences[i]}\n')
+                    if sentence_keywords is not None:
+                        kws = sentence_keywords[i] #[[w1,w2,w3],[w1,w2,w3]]
+                        keywords.extend(kws[0]+kws[1])
+                    # f.writelines(f'score:{round(sims[i].item(),3)}\n')
+                    # f.writelines('\n\n')
+                    #keywords_per_subsent = sentence_keywords[i] #[] usually consists of two subsentences
 
             if not args.model=='TRIPLET' or sentence_keywords is None:
                 f.close()
@@ -203,8 +225,8 @@ if __name__=='__main__':
     parser.add_argument('--model_path', default='') 
     parser.add_argument('--model', default='TRIPLET') 
     parser.add_argument('--rerank', action='store_true')
-    parser.add_argument('--sentence_embed_path', required=True)
-    parser.add_argument('--sentence_path', required=True)
+    parser.add_argument('--sentence_embed_paths', required=True)
+    parser.add_argument('--sentence_paths', required=True) #split by ,
     parser.add_argument('--keyword_path', default='keyword.pkl')
     parser.add_argument('--id2poem_path', required=True)
     parser.add_argument('--batch_size', default=512, type=int) 

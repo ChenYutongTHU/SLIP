@@ -299,11 +299,12 @@ class TripletDataset_from_rawfile(torch.utils.data.Dataset):
         if image_arr.shape[-1]!=3:
             if len(image_arr.shape)==2:
                 image_arr = image_arr[:,:,None]
-            image_arr = np.tile(image_arr, [1,1,3])  
+                image_arr = np.tile(image_arr, [1,1,3]) 
+            elif image_arr.shape[-1]==4:
+                image_arr = image_arr[:,:,:3] 
         image = Image.fromarray(image_arr)     
         image = self.preprocess(image)
         
-        #print(f'en:{self.en[index]}, zh:{self.zh[index]}')
         en = self.tokenizer['en'](self.en[index])
         zh = self.tokenizer['zh'](self.zh[index])   
         #print(f'--> en {en} zh{zh}')
