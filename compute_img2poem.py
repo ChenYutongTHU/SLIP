@@ -21,7 +21,7 @@ def main(args):
     sentence_embeddings = torch.load(args.sentence_embed_path,map_location='cpu')
     assert len(sentences)==len(sentence_embeddings), (len(sentences),len(sentence_embeddings))
     
-    if args.rerank and os.path.isfile('.'.join(args.keyword_path)):
+    if args.rerank and os.path.isfile(args.keyword_path):
         print('Load keywords ...')
         sentence_keywords = json.load(open(args.keyword_path,'r'))
         assert len(sentences)==len(sentence_keywords), (len(sentences),len(sentence_keywords))    
