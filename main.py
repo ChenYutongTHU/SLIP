@@ -212,6 +212,8 @@ def main(args):
     else:
         if args.model == 'ALTCLIP':
             tokenizer = {'en':utils.get_model(model).tokenizer, 'zh':utils.get_model(model).tokenizer}
+        elif args.model == 'MCLIP':
+            tokenizer = {'en':utils.get_model(model).tokenizer, 'zh':utils.get_model(model).tokenizer}
         else:
             tokenizer = SimpleTokenizer()
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -227,7 +229,8 @@ def main(args):
             transforms.ToTensor(),
             normalize
         ])
-
+    if args.model=="MCLIP":
+        val_transform = utils.get_model(model).transform
     train_dataset = {}
     if args.training_mode == 'auto':
         if args.need_only_text:
@@ -316,7 +319,7 @@ def main(args):
         if args.model.startswith('SIMCLR'):
             print('zero-shot evaluation not supported with ssl-only model.')
             return
-        elif args.model in ['TRIPLET','ALTCLIP'] :
+        elif args.model in ['TRIPLET','ALTCLIP','MCLIP'] :
             if args.evaluate_retrieval:
                 zero_stats = validate_retrieval_bilingual(model, val_transform, tokenizer, args)
             elif args.evaluate_text_retrieval:
@@ -708,7 +711,7 @@ def validate_retrieval_bilingual(model, val_transform, tokenizer, args):
         'pseudo_translated': 'img2poem/pseudo/{}',
         'fengzikai_translated': 'img2poem/pseudo/{}', 'parallel_translated': 'img2poem/pseudo/{}',
     }
-    for dataset in ['coco-cn','pseudo_translated','fengzikai_translated', 'parallel_translated','coco_poem7_2k']:#, 'aic']:#,'aic']:
+    for dataset in ['coco-cn']:#,'pseudo_translated','fengzikai_translated', 'parallel_translated','coco_poem7_2k']:#, 'aic']:#,'aic']:
         print(f'Evaluate Img<->Text Retrieval on {dataset} ...')
         with open(DATASET2FILE[dataset],'r') as f:
             img2captions = json.load(f)
@@ -1198,10 +1201,11 @@ def validate_zeroshot(val_loader, model, tokenizer, args):
         text_features = []
         for l in labels:
             texts = [t.format(l) for t in templates]
-            texts = tokenizer['en'](texts).cuda(args.gpu, non_blocking=True)
             if args.model.startswith('TRIPLET'):
+                texts = tokenizer['en'](texts).cuda(args.gpu, non_blocking=True)
                 class_embeddings = utils.get_model(model).model_en.encode_text(texts)
             else:
+                #TODO 
                 class_embeddings = utils.get_model(model).encode_text(texts)
             class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
             class_embeddings = class_embeddings.mean(dim=0)

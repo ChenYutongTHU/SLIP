@@ -430,7 +430,7 @@ def get_dataset(train_transform, tokenizer, dataset_names, args,
         return ImageCaptionDatasetCLIP(args.dataset, args.root, args.metadata, train_transform, tokenizer)
     elif args.model.startswith('SLIP'):
         return ImageCaptionDatasetSLIP(args.dataset, args.root, args.metadata, train_transform, augment, tokenizer)
-    elif args.model.startswith('TRIPLET') or args.model.startswith('ALTCLIP'):
+    elif args.model.startswith('TRIPLET') or args.model.startswith('ALTCLIP') or args.model.startswith('MCLIP'):
         need_img = not need_only_text #(not args.need_only_text)
         catalog = json.load(open('dataset_catalog.json', 'r'))
         if read_tsv:

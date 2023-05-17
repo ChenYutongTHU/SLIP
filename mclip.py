@@ -23,6 +23,7 @@ class MClip(torch.nn.Module):
             return_tensors='pt')
         self.vision_model, _, self.transform = open_clip.create_model_and_transforms('ViT-B-16-plus-240', pretrained="laion400m_e32")
         self.vision_model.to(device)
+        self.logit_scale = torch.tensor(1.0) #DIRTY SOLUTION
 
     def normalize(self, x, eps=0):
         return x/(x.norm(dim=-1, keepdim=True)+eps)
@@ -31,14 +32,14 @@ class MClip(torch.nn.Module):
         lang2text_features = {'zh':None, 'en':None}
 
         embs = self.text_model.transformer(input_ids=zh_input_ids, attention_mask=zh_attention_mask)[0]
-        # import ipdb; ipdb.set_trace()
         att = zh_attention_mask
         embs = (embs * att.unsqueeze(2)).sum(dim=1) / att.sum(dim=1)[:, None] #B,D
-        
-        # import ipdb; ipdb.set_trace()
         embs = self.text_model.LinearTransformation(embs)
-        # import ipdb; ipdb.set_trace()
         lang2text_features['zh'] = self.normalize(embs)
+
+        #DIRTY SOLUTION
+        lang2text_features['en'] = lang2text_features['zh']
+
         return lang2text_features['zh'], lang2text_features['en']
 
     def encode_image(self, images):

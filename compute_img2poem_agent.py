@@ -134,7 +134,7 @@ class Agent():
                     batch = batch.squeeze(1)
                 with torch.no_grad():
                     kw_embeddings, _ ,_, _, _ = \
-                        utils.get_model(self.model).encode_text(zh=batch.cuda(), en=None, output_attention=True)
+                        utils.get_model(self.model).encode_text(zh=batch.to(self.config.gpu), en=None, output_attention=True)
                 for kwe in kw_embeddings:
                     keywords_embedding[cnt_%len(keywords)] += kwe # D
                     cnt_ += 1
@@ -168,7 +168,7 @@ class Agent():
         self.tokenizer = utils.get_model(self.model).tokenize_zh
 
         self.logger.info("Running on GPU "+self.config.gpu)
-        self.model.cuda(self.config.gpu)
+        self.model = self.model.to(self.config.gpu)
         return
 
     def init_sentence(self):
