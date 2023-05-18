@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-import bmtrain as bmt
+# import bmtrain as bmt
 from typing import Optional
 
 class Linear(bmt.DistributedModule):
