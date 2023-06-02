@@ -75,7 +75,7 @@ class Agent():
             elif 'poem_id' in self.sentences[i]:
                 poem = self.id2poem[self.sentences[i]['poem_id']]
             results['sens'].append(self.sentences[i]['content'])
-            results['source'][str(i)] = {'title': poem['title'], 'author': poem['author'], 'dynasty': poem['dynasty']}
+            results['source'][str(rank)] = {'title': poem['title'], 'author': poem['author'], 'dynasty': poem['dynasty']}
             results['sourcecontent'].append(poem['content_list'])
             self.logger.info(f'Retrieve top{rank}:  {results["sens"][-1]} ' + ' '.join(['{}:{:.3f}'.format(k, v) for k,v in scores[rank].items()]))
         return results
