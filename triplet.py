@@ -47,7 +47,7 @@ class Triplet(torch.nn.Module):
         self.use_allgather = cfg['use_allgather']
         self.model_en, self.preprocess = clip.load(cfg['Model_En'], device=device)
         self.tokenize_en = clip.tokenize
-        
+
         self.both_en = cfg.get('both_en',None) #'different_rand')
         if self.both_en==None:
             self.lang = ['en','zh']
@@ -248,6 +248,12 @@ class Triplet(torch.nn.Module):
             del self.model_en
             
     #     self.model_weights_check()
+        self.mask_clip = cfg.get('mask_clip',False) #New feature
+        if self.mask_clip:
+            self.visual.transformer.enable_mask_clip()
+            assert self.visual.proj is None
+
+
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -278,9 +284,13 @@ class Triplet(torch.nn.Module):
         return output
     
     def encode_image(self, img):
-        img_x = self.visual(img.type(self.model_zh.dtype))[:,0,:] #B,D
-        image_features = img_x @ self.visual_proj
-        return image_features
+        img_x, attention_weights = self.visual(img.type(self.model_zh.dtype)) #B,L,D
+        image_features = img_x @ self.visual_proj #B,L,D
+        if self.mask_clip:
+            return image_features, attention_weights
+        else:
+            return image_features[:,0,:]
+
     
     def normalize(self, x, eps=0):
         return x/(x.norm(dim=-1, keepdim=True)+eps)

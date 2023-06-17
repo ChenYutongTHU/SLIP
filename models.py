@@ -339,8 +339,9 @@ def SLIP_VITL16(**kwargs):
 
     return model
 
-def TRIPLET(model_cfg_path, toolkit='torch', **kwargs):
+def TRIPLET(model_cfg_path, toolkit='torch', mask_clip=False, **kwargs):
     cfg = load_config(model_cfg_path)
+    cfg['mask_clip'] = mask_clip
     if toolkit=='torch':
         model = Triplet(cfg, device='cpu')
     elif toolkit=='bm':

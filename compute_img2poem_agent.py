@@ -9,6 +9,18 @@ import torchvision.transforms as transforms
 import yaml
 import logging
 from pathlib import Path
+def gaussian_weight(n, std):
+    xs, ys = np.meshgrid(np.arange(n), np.arange(n))    
+    weight_map = np.exp(((xs-n/2.)*(xs-n/2.)+(ys-n/2.)*(ys-n/2.))/(-2*std*std))
+    return weight_map
+n_cand = 40
+T, T_hat = 0.18, 0.6
+s_img_threshold, s_region_threshold = 0.19, 10 
+inv_temp = 0.3
+std = 5/3
+w_0, w_p, w_n = 100, 3, 0.5
+weight_loc = torch.tensor(gaussian_weight(16, std=std))
+
 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                     std=[0.229, 0.224, 0.225])
 val_transform = transforms.Compose([
@@ -52,6 +64,7 @@ class CONFIG:
 class Agent():
     def __init__(self, cfg_path):
         self.config = CONFIG(cfg_path)
+        self.mask_clip = getattr(self.config,'mask_clip', False)
         self.rerank, self.gpu = self.config.rerank, self.config.gpu
 
         self.logger = setup_logger(
@@ -80,8 +93,34 @@ class Agent():
             self.logger.info(f'Retrieve top{rank}:  {results["sens"][-1]} ' + ' '.join(['{}:{:.3f}'.format(k, v) for k,v in scores[rank].items()]))
         return results
 
+    def compute_keywords_embedding(self, keywords, TEMPLATES):
+        keywords_prompt = []
+        n_template = len(TEMPLATES)
+        for TEMPLATE in TEMPLATES: #kw_id = id%n_template
+            keywords_prompt.extend([TEMPLATE.replace('{}',kw) for kw in keywords])
+        keywords_dataset = Sentence_dataset(keywords_prompt, self.tokenizer)
+        keywords_loader = torch.utils.data.DataLoader(keywords_dataset, 
+                                                    batch_size=self.config.batch_size_kw, 
+                                                    shuffle=False)
+        keywords_embedding = [0 for kw in keywords]
+        cnt_ = 0
+        for batch in tqdm(keywords_loader, total=len(keywords_loader)):
+            if batch.dim()==3:
+                batch = batch.squeeze(1)
+            with torch.no_grad():
+                kw_embeddings, _ ,_, _, _ = \
+                    utils.get_model(self.model).encode_text(zh=batch.to(self.config.gpu), en=None, output_attention=True)
+            for kwe in kw_embeddings:
+                keywords_embedding[cnt_%len(keywords)] += kwe # D
+                cnt_ += 1
+        keywords_embedding = torch.stack(keywords_embedding, dim=0)/n_template #N.D
+        keywords_embedding = torch.nn.functional.normalize(keywords_embedding, dim=1) 
+        keyword2embed = {kw:e for kw, e in zip(keywords, keywords_embedding)}
+        return keyword2embed   
+        
     def inference(self, image, image_name):
         #image an np.array or PIL.Image
+        extra_info = {}
         self.logger.info(f'Receive image -- {image_name}')
         image_arr = np.array(image)
         if image_arr.shape[-1]!=3:
@@ -93,7 +132,16 @@ class Agent():
         image = Image.fromarray(image_arr)     
         image = val_transform(image).unsqueeze(0)
         with torch.no_grad():
-            image_features = utils.get_model(self.model).encode_image(image.to(self.gpu)) #B,
+            outputs_ = utils.get_model(self.model).encode_image(image.to(self.gpu)) #B,
+        if self.mask_clip:
+            outputs, attention_weights = outputs_
+            image_features = outputs[:,0,:]
+            dense_features = outputs[:,:,:]
+            dense_features = dense_features / dense_features.norm(dim=-1, keepdim=True)
+            extra_info['dense_features'] = dense_features
+            extra_info['attention_weights'] = attention_weights
+        else:
+            image_features = outputs_
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         image_feature = image_features.squeeze(0)
         
@@ -107,64 +155,91 @@ class Agent():
         sims = torch.cat(sims, dim=0)
         sorted_, indices = torch.sort(sims, descending=True)
 
+        #record
+        self.indices = indices
+        self.global_sims = sims
+
         if self.rerank==False:
             return self.return_results(
                 indices,
-                scores = [{'sim': sims[i].item()} for i in indices])
+                scores = [{'sim': sims[i].item()} for i in indices]), extra_info
         else:
             keywords = []
             for i in indices[:self.config.topk]:
                 kws = self.sentence_keywords[i]
-                keywords.extend(kws[0]+kws[1])
+                if len(kws)==2 and type(kws[0])==list:
+                    keywords.extend(kws[0]+kws[1])
+                else:
+                    keywords.extend(kws)
             keywords = list(set(keywords))
-            self.logger.info(f'Compute keywords embeddings (#={len(keywords)})')
-            keywords_prompt = []
-            TEMPLATES=['这张图片里有{}。']
-            n_template = len(TEMPLATES)
-            for TEMPLATE in TEMPLATES: #kw_id = id%n_template
-                keywords_prompt.extend([TEMPLATE.replace('{}',kw) for kw in keywords])
-            keywords_dataset = Sentence_dataset(keywords_prompt, self.tokenizer)
-            keywords_loader = torch.utils.data.DataLoader(keywords_dataset, 
-                                                          batch_size=self.config.batch_size_kw, 
-                                                          shuffle=False)
-            keywords_embedding = [0 for kw in keywords]
-            cnt_ = 0
-            for batch in tqdm(keywords_loader, total=len(keywords_loader)):
-                if batch.dim()==3:
-                    batch = batch.squeeze(1)
-                with torch.no_grad():
-                    kw_embeddings, _ ,_, _, _ = \
-                        utils.get_model(self.model).encode_text(zh=batch.to(self.config.gpu), en=None, output_attention=True)
-                for kwe in kw_embeddings:
-                    keywords_embedding[cnt_%len(keywords)] += kwe # D
-                    cnt_ += 1
-            keywords_embedding = torch.stack(keywords_embedding, dim=0)/n_template #N.D
-            keywords_embedding = torch.nn.functional.normalize(keywords_embedding, dim=1)                 
-        keyword2embed = {kw:e for kw, e in zip(keywords, keywords_embedding)}
-        keyword2sim = {}
 
-        reranked_results = []
-        for rank, i in enumerate(indices[:self.config.topk]):
-            rank += 1
-            kws = self.sentence_keywords[i][0]+self.sentence_keywords[i][1]
-            kw_star = 1
-            for kw in kws:
-                assert kw in keyword2embed, kw
-                local_sim = image_feature@keyword2embed[kw]  #1,D D
-                keyword2sim[kw] = local_sim.cpu().item()
-                kw_star = min(kw_star, keyword2sim[kw])
-            if kw_star>self.config.B0 and kw_star!=1:
-                c = self.config.wa*sims[i].item()+(1-self.config.wa)*kw_star
-                reranked_results.append({'id':i, 'b':kw_star, 'a':sims[i].item(), 'c':c})
-        reranked_results = sorted(reranked_results, key=lambda r:r['c']*-1)
-        return self.return_results(
-            [r['id'] for r in reranked_results],
-            scores = [{k:v for k,v in r.items() if not k=='id'} for r in reranked_results])
+            self.logger.info(f'Compute keywords embeddings (#={len(keywords)})')
+            if self.mask_clip:
+                keyword2embed_word = self.compute_keywords_embedding(keywords, TEMPLATES=['{}'])
+                keyword2dense_sim = {}
+                for kw, embed in keyword2embed_word.items():
+                    dense_sim = dense_features@embed #1, 256, 1024
+                    #grid_size = int(math.sqrt(dense_sim.shape[1]))
+                    #dense_sim = dense_sim.squeeze(0).reshape([grid_size, grid_size,-1])
+                    keyword2dense_sim[kw] = dense_sim.cpu()
+                extra_info['keyword2dense_sim'] = keyword2dense_sim
+            else:
+                keyword2embed = self.compute_keywords_embedding(keywords, TEMPLATES=['这张图片里有{}。'])
+                keyword2sim = {}
+            reranked_results = []
+            for rank, i in enumerate(indices[:self.config.topk]):
+                rank += 1
+                if len(self.sentence_keywords[i])==2 and type(self.sentence_keywords[i][0]) == list:
+                    kws = self.sentence_keywords[i][0]+self.sentence_keywords[i][1]
+                else:
+                    kws = self.sentence_keywords[i]
+                # rerank - v1
+                keywords_p, keywords_n = [], []
+                s_n, A = 0, torch.zeros(16,16)
+                for kw in kws:
+                    cam = extra_info['keyword2dense_sim'][kw][0] #257
+                    sim_img, sim_patch = cam[0].item(), cam[1:].view(16,16)
+                    sim_patch = sim_patch*(sim_patch>0.18)
+                    sim_region = torch.sum(sim_patch).item()
+                    #condition for positive/negative keywords:
+                    if (sim_img>s_img_threshold) or (sim_region>s_region_threshold):
+                        keywords_p.append(kw)
+                        sim_patch_hat = (sim_patch-sim_patch.min())/(sim_patch.max()-sim_patch.min())
+                        A += (sim_patch_hat>T_hat)
+                    else:
+                        keywords_n.append(kw)
+                        s_n -= math.exp(inv_temp*(max(s_region_threshold-sim_region,0)))
+                A = (A.bool()).int()
+                s_p = torch.sum(weight_loc*A).item()
+                s_0 = self.global_sims[i].item()
+                s_overall = w_0*s_0 + w_p*s_p + w_n*s_n
+                reranked_results.append({'id':i, 's_0':s_0, 
+                                        's_p':s_p, 's_n':s_n, 's_overall':s_overall})
+                ''' rerank - v0
+                kw_star = 1
+                for kw in kws:
+                    assert kw in keyword2embed, kw
+                    local_sim = image_feature@keyword2embed[kw]  #1,D D
+                    keyword2sim[kw] = local_sim.cpu().item()
+                    kw_star = min(kw_star, keyword2sim[kw])
+                if kw_star>self.config.B0 and kw_star!=1:
+                    c = self.config.wa*sims[i].item()+(1-self.config.wa)*kw_star
+                    reranked_results.append({'id':i, 'b':kw_star, 'a':sims[i].item(), 'c':c})
+                '''
+            reranked_results = sorted(reranked_results, key=lambda r:r['s_overall']*-1)
+            # reranked_results = sorted(reranked_results, key=lambda r:r['c']*-1) rerank-v0
+
+            return self.return_results(
+                [r['id'] for r in reranked_results],
+                scores = [{k:v for k,v in r.items() if not k=='id'} for r in reranked_results]), \
+                extra_info
 
     def init_model(self):
         self.logger.info("Build and load TRIPLET model from "+self.config.model_path)
         self.model = build_and_load_model('TRIPLET', 
-                                          self.config.model_cfg_path, self.config.model_path)
+                                          self.config.model_cfg_path, 
+                                          self.config.model_path,
+                                          mask_clip=self.mask_clip)
         self.tokenizer = utils.get_model(self.model).tokenize_zh
 
         self.logger.info("Running on GPU "+self.config.gpu)

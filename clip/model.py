@@ -196,12 +196,23 @@ class ResidualAttentionBlock(nn.Module):
             y = self.attn(x, x, x, need_weights=True, attn_mask=attn_mask)
             return y
     
-    def forward(self, x: torch.Tensor, attn_mask=None):
+    def forward(self, x: torch.Tensor, attn_mask=None, mask_clip=False):
         # x = x + self.attention(self.ln_1(x))
         # x = x + self.mlp(self.ln_2(x))
         # return x
-        attn_output, attn_weights = self.attention(self.ln_1(x), attn_mask=attn_mask) #attn_weight B, H, L, S
-        x = x + attn_output
+        if mask_clip:
+            assert attn_mask==None and self.attn_mask==None
+            #temporarily set self.attn_mask to:
+            self.attn_mask = torch.eye(x.shape[0], device=x.device).long()
+            self.attn_mask[0] = 1 #[CLS] attends to all; others attend to themselves
+            self.attn_mask = torch.where(self.attn_mask.bool(), 0, float('-inf'))
+            #print(self.attn_mask)
+            attn_output, attn_weights = self.attention(self.ln_1(x), attn_mask=attn_mask) #attn_weight B, H, L, S
+            x = x[0:1] + attn_output # Use [CLS]'s second-last-layer hidden
+            self.attn_mask = None #reset
+        else:
+            attn_output, attn_weights = self.attention(self.ln_1(x), attn_mask=attn_mask) #attn_weight B, H, L, S
+            x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
         return x, attn_weights
 
@@ -213,13 +224,19 @@ class Transformer(nn.Module):
         self.layers = layers
         self.heads = heads
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.mask_clip = False
+    
+    def enable_mask_clip(self):
+        print('mask_clip=True, modify the last residual layer of VisualTransformer')
+        self.mask_clip = True
 
     def forward(self, x: torch.Tensor, attn_mask=None):
         #return self.resblocks(x)
         layers_attn_weights = []
         xs = []
         for i in range(self.layers):
-            x, attn_weights = self.resblocks[i](x, attn_mask)
+            x, attn_weights = self.resblocks[i](x, attn_mask, 
+                                                mask_clip=(i==self.layers-1 and self.mask_clip))
             layers_attn_weights.append(attn_weights)
             xs.append(x)
         return xs, layers_attn_weights
@@ -244,6 +261,7 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
         self.return_full_embed = return_full_embed
 
+
     def forward(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
@@ -258,10 +276,10 @@ class VisionTransformer(nn.Module):
 
         x = self.ln_post(x)
 
-        if self.proj is not None:
+        if self.proj is not None:  
             x = x @ self.proj
 
-        return x
+        return x, attention_weights
 
 class X_Attn_Encoder(nn.Module):
     def __init__(self,
