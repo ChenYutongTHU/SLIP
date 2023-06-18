@@ -57,7 +57,10 @@ class CONFIG:
     def __init__(self, file_path):
         with open(file_path, 'r') as f:
             self.data = yaml.safe_load(f)
+        dir_path = os.path.dirname(os.path.realpath(__file__))
         for k,v in self.data.items():
+            if type(v)==str and os.path.exists(os.path.join(dir_path, v)):
+                v = os.path.join(dir_path, v)
             setattr(self, k, v)
 
 
@@ -79,17 +82,23 @@ class Agent():
             self.init_keyword()
         
         return
-    
+
+    def split(self, sen):
+        return [sen[:len(sen)//2],sen[len(sen)//2:]]
+
     def return_results(self, indices, scores):
-        results = {'sens':[], 'source':{}, 'sourcecontent':[]}
+        results = {'sens':[], 'source':{}, 'sourcecontent':[],'scores':[]}
         for rank, i in enumerate(indices[:self.config.return_topk]):
             if 'id' in self.sentences[i]:
                 poem = self.id2poem[self.sentences[i]['id']]
             elif 'poem_id' in self.sentences[i]:
                 poem = self.id2poem[self.sentences[i]['poem_id']]
-            results['sens'].append(self.sentences[i]['content'])
+            #results['sens'].append(self.sentences[i]['content'])
+            results['sens'].append(self.split(self.sentences[i]['content']))
             results['source'][str(rank)] = {'title': poem['title'], 'author': poem['author'], 'dynasty': poem['dynasty']}
-            results['sourcecontent'].append(poem['content_list'])
+            #results['sourcecontent'].append(poem['content_list'])
+            results['sourcecontent'].append([self.split(cl) for cl in poem['content_list']])
+            results['scores'].append(scores[rank])
             self.logger.info(f'Retrieve top{rank}:  {results["sens"][-1]} ' + ' '.join(['{}:{:.3f}'.format(k, v) for k,v in scores[rank].items()]))
         return results
 

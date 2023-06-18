@@ -7,12 +7,12 @@ from tqdm import tqdm
 # segmentor = Poem_Segmenter()  
 
 
-def build_and_load_model(model_type, model_cfg_path, model_path):
+def build_and_load_model(model_type, model_cfg_path, model_path, **kwargs):
     print('Building model')
     if model_type=='TRIPLET':
         model = getattr(models, 'TRIPLET')(
             ssl_mlp_dim=4096, ssl_emb_dim=256,
-            model_cfg_path=model_cfg_path, toolkit='torch')
+            model_cfg_path=model_cfg_path, toolkit='torch', **kwargs)
     else:
         model = getattr(models, model_type)()
     if model_path!='':

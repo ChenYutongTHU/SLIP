@@ -128,7 +128,7 @@ class Triplet(torch.nn.Module):
         if self.model_zh_type=='wukong':
             del self.model_zh.logit_scale
         
-        print('Logit_scale={:.2f}({}) Visual_proj={}'.format(self.logit_scale, cfg['logit_scale'], cfg['visual_proj']))
+        # print('Logit_scale={:.2f}({}) Visual_proj={}'.format(self.logit_scale, cfg['logit_scale'], cfg['visual_proj']))
         # self.contrastive_type = cfg['contrastive_type']
         # if self.contrastive_type in ['one_one','one_mean']:
         #     self.criterion = ClipInfoCELoss()

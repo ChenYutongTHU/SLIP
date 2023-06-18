@@ -13,12 +13,12 @@ import torch
 from torch import nn
 from utils import load_config
 from triplet import Triplet
-from triplet_bm import Triplet_bm
-import bmtrain as bmt
+# from triplet_bm import Triplet_bm
+# import bmtrain as bmt
 import losses
 from altclip import AltCLIP
 from taiyi import Taiyi
-from mclip import MClip
+# from mclip import MClip
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""

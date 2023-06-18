@@ -17,7 +17,7 @@ import time
 from collections import defaultdict, deque
 import datetime
 import subprocess
-import bmtrain as bmt
+# import bmtrain as bmt
 TOOLKIT = 'torch'
 def get_sha():
     cwd = os.path.dirname(os.path.abspath(__file__))

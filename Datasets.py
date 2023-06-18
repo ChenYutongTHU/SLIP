@@ -17,8 +17,8 @@ from torchvision import transforms
 from torchvision import datasets as t_datasets
 from read_tsv import TSVFile, img_from_base64
 import utils
-from model_center.dataset import DistributedMMapIndexedDataset, MMapIndexedDataset
-import bmtrain as bmt
+# from model_center.dataset import DistributedMMapIndexedDataset, MMapIndexedDataset
+# import bmtrain as bmt
 import random
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 

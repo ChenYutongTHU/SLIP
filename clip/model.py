@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from .model_bm import CLIP_bm
+# from .model_bm import CLIP_bm
 
 
 class Bottleneck(nn.Module):
